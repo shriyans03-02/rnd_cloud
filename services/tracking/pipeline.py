@@ -4369,6 +4369,7 @@
 #     g.add_argument("--use-deepsort", action="store_true", help="Force DeepSORT")
 #     g.add_argument("--use-strongsort", action="store_true", help="Force StrongSORT (BoxMOT)")
 #     g.add_argument("--use-bytetrack", action="store_true", help="Force ByteTrack (BoxMOT)")
+#     g.add_argument("--use-hybrid-tracker", action="store_true", help="Production mode: ByteTrack every frame + StrongSORT/ReID only for lost/occlusion/new-track recovery.")
 
 #     ap.add_argument("--strongsort-reid-weights", default=r"osnet_x1_0_msmt17.pt", help="ReID weights path for StrongSORT (BoxMOT).")
 #     ap.add_argument("--boxmot-device", choices=["auto", "cuda", "cpu"], default="auto", help="Device for BoxMOT/StrongSORT ReID. auto uses GPU unless --cuda-safe-mode is active with face CUDA.")
@@ -9452,6 +9453,318 @@ class IOUTracker:
         return outs
 
 
+def _track_xyxy(track: Any) -> Optional[Tuple[float, float, float, float]]:
+    """Best-effort TrackLike/BoxMOT track -> xyxy."""
+    try:
+        if hasattr(track, "to_tlbr"):
+            x1, y1, x2, y2 = map(float, track.to_tlbr())
+        elif hasattr(track, "to_ltrb"):
+            x1, y1, x2, y2 = map(float, track.to_ltrb())
+        else:
+            x1, y1, x2, y2 = map(float, getattr(track, "tlbr"))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return float(x1), float(y1), float(x2), float(y2)
+    except Exception:
+        return None
+
+
+def _track_id(track: Any) -> int:
+    try:
+        return int(getattr(track, "track_id", getattr(track, "track_id_", -1)))
+    except Exception:
+        return -1
+
+
+def _track_conf(track: Any) -> float:
+    try:
+        val = getattr(track, "det_conf", None)
+        if val is not None:
+            return float(val)
+        ld = getattr(track, "last_detection", None)
+        if isinstance(ld, dict):
+            return float(ld.get("confidence", ld.get("det_conf", 0.0)) or 0.0)
+        if isinstance(ld, (list, tuple)) and len(ld) >= 2:
+            return float(ld[1])
+    except Exception:
+        pass
+    return 0.0
+
+
+def _tracks_to_boxmot_array(tracks: List[Any], stable_id_by_raw: Dict[int, int]) -> np.ndarray:
+    rows: List[List[float]] = []
+    for tr in tracks or []:
+        raw_tid = _track_id(tr)
+        if raw_tid < 0:
+            continue
+        box = _track_xyxy(tr)
+        if box is None:
+            continue
+        x1, y1, x2, y2 = box
+        stable_tid = int(stable_id_by_raw.get(int(raw_tid), int(raw_tid)))
+        rows.append([float(x1), float(y1), float(x2), float(y2), float(stable_tid), float(_track_conf(tr)), 0.0])
+    if not rows:
+        return np.zeros((0, 7), dtype=np.float32)
+    return np.asarray(rows, dtype=np.float32)
+
+
+def _dets_have_occlusion_xyxy(dets_boxmot: np.ndarray, iou_thresh: float) -> bool:
+    try:
+        arr = np.asarray(dets_boxmot, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[0] < 2 or arr.shape[1] < 4:
+            return False
+        thr = float(max(0.0, float(iou_thresh or 0.0)))
+        if thr <= 0.0:
+            return False
+        for i in range(int(arr.shape[0])):
+            a = arr[i, :4]
+            for j in range(i + 1, int(arr.shape[0])):
+                if iou_xyxy(a, arr[j, :4]) >= thr:
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+class HybridByteTrackReIDTracker:
+    """ByteTrack-first tracker with event-driven StrongSORT/ReID recovery.
+
+    Fast path: ByteTrack runs every frame. Recovery path: StrongSORT/ReID runs
+    only on new raw IDs, lost-track windows, occlusions, or sparse periodic
+    refreshes. The recovery ID is used to map new ByteTrack IDs back onto a
+    stable logical track ID after occlusion/disappearance.
+    """
+
+    def __init__(self, byte_tracker: Any, strong_tracker: Any, args: Any, *, sid: int = 0, camera_id: int = -1):
+        self.byte_tracker = byte_tracker
+        self.strong_tracker = strong_tracker
+        self.args = args
+        self.sid = int(sid)
+        self.camera_id = int(camera_id)
+        self._pipeline_backend = "hybrid"
+        self.enabled = bool(getattr(args, "reid_recovery_enabled", True)) and strong_tracker is not None
+        self.reid_every_n = int(max(0, int(getattr(args, "reid_recovery_every_n", 12) or 0)))
+        self.reid_min_gap = int(max(1, int(getattr(args, "reid_recovery_min_gap_frames", 4) or 1)))
+        self.lost_ttl = int(max(1, int(getattr(args, "reid_recovery_lost_ttl", 80) or 80)))
+        self.match_iou = float(max(0.01, float(getattr(args, "reid_recovery_match_iou", 0.30) or 0.30)))
+        self.occlusion_iou = float(max(0.0, float(getattr(args, "reid_recovery_occlusion_iou", 0.25) or 0.25)))
+        self.log_enabled = bool(getattr(args, "reid_recovery_log", True) or getattr(args, "debug_log", False))
+        self.log_interval_s = float(max(0.2, float(getattr(args, "perf_log_interval", 2.0) or 2.0)))
+        self.frame_idx = 0
+        self.next_stable_id = 1
+        self.byte_to_stable: Dict[int, int] = {}
+        self.ss_to_stable: Dict[int, int] = {}
+        self.active: Dict[int, Dict[str, Any]] = {}
+        self.lost: Dict[int, Dict[str, Any]] = {}
+        self.last_reid_frame = -10**9
+        self.last_reid_used = False
+        self.last_reid_reason = ""
+        self.last_byte_ms = 0.0
+        self.last_reid_ms = 0.0
+        self.last_match_count = 0
+        self.byte_runs = 0
+        self.reid_runs = 0
+        self.errors = 0
+        self.last_output_tracks = 0
+        self._last_log_mono = 0.0
+
+    def _new_stable_id(self) -> int:
+        sid = int(self.next_stable_id)
+        self.next_stable_id += 1
+        return sid
+
+    def _cleanup(self) -> None:
+        for stable_id, info in list(self.lost.items()):
+            last_frame = int(info.get("last_frame", -10**9))
+            if int(self.frame_idx) - last_frame > self.lost_ttl:
+                self.lost.pop(int(stable_id), None)
+        active_stables = set(int(k) for k in self.active.keys())
+        live_or_lost = active_stables | set(int(k) for k in self.lost.keys())
+        for raw_tid, stable_id in list(self.byte_to_stable.items()):
+            if int(stable_id) not in live_or_lost and self.frame_idx > self.lost_ttl:
+                self.byte_to_stable.pop(int(raw_tid), None)
+
+    def _recover_by_geometry(self, bbox: Tuple[float, float, float, float]) -> Optional[int]:
+        best_sid = None
+        best_score = 0.0
+        bx1, by1, bx2, by2 = map(float, bbox)
+        bw = max(1.0, bx2 - bx1)
+        bh = max(1.0, by2 - by1)
+        bc = ((bx1 + bx2) * 0.5, (by1 + by2) * 0.5)
+        for stable_id, info in list(self.lost.items()):
+            old = info.get("bbox")
+            if old is None:
+                continue
+            ox1, oy1, ox2, oy2 = map(float, old)
+            ow = max(1.0, ox2 - ox1)
+            oh = max(1.0, oy2 - oy1)
+            oc = ((ox1 + ox2) * 0.5, (oy1 + oy2) * 0.5)
+            iou = float(iou_xyxy((bx1, by1, bx2, by2), (ox1, oy1, ox2, oy2)))
+            dx = abs(bc[0] - oc[0]) / max(bw, ow)
+            dy = abs(bc[1] - oc[1]) / max(bh, oh)
+            size_ratio = min((bw * bh) / max(1.0, ow * oh), (ow * oh) / max(1.0, bw * bh))
+            score = iou + 0.35 * max(0.0, 1.0 - dx) + 0.35 * max(0.0, 1.0 - dy) + 0.20 * size_ratio
+            if iou >= 0.10 or (dx <= 0.45 and dy <= 0.55 and size_ratio >= 0.45):
+                if score > best_score:
+                    best_score = score
+                    best_sid = int(stable_id)
+        if best_sid is not None:
+            self.lost.pop(int(best_sid), None)
+        return best_sid
+
+    def _match_byte_to_strong(self, byte_tracks: List[Any], strong_tracks: List[Any]) -> Dict[int, int]:
+        matches: Dict[int, int] = {}
+        used_ss: set[int] = set()
+        ss_boxes: Dict[int, Tuple[float, float, float, float]] = {}
+        for st in strong_tracks or []:
+            ss_id = _track_id(st)
+            box = _track_xyxy(st)
+            if ss_id >= 0 and box is not None:
+                ss_boxes[int(ss_id)] = box
+        for bt in byte_tracks or []:
+            bt_id = _track_id(bt)
+            b_box = _track_xyxy(bt)
+            if bt_id < 0 or b_box is None:
+                continue
+            best_ss = -1
+            best_iou = 0.0
+            for ss_id, s_box in ss_boxes.items():
+                if int(ss_id) in used_ss:
+                    continue
+                val = float(iou_xyxy(b_box, s_box))
+                if val > best_iou:
+                    best_iou = val
+                    best_ss = int(ss_id)
+            if best_ss >= 0 and best_iou >= self.match_iou:
+                matches[int(bt_id)] = int(best_ss)
+                used_ss.add(int(best_ss))
+        self.last_match_count = int(len(matches))
+        return matches
+
+    def _should_run_reid(self, dets_boxmot: np.ndarray, byte_tracks: List[Any], new_raw_ids: List[int]) -> Tuple[bool, str]:
+        if not self.enabled:
+            return False, "disabled"
+        det_count = int(np.asarray(dets_boxmot).shape[0]) if dets_boxmot is not None else 0
+        if det_count <= 0:
+            return False, "empty"
+        reasons: List[str] = []
+        if new_raw_ids:
+            reasons.append(f"new:{len(new_raw_ids)}")
+        if self.lost:
+            reasons.append(f"lost:{len(self.lost)}")
+        if _dets_have_occlusion_xyxy(dets_boxmot, self.occlusion_iou):
+            reasons.append("occlusion")
+        if self.reid_every_n > 0 and (int(self.frame_idx) % int(self.reid_every_n)) == 0:
+            reasons.append("periodic")
+        if not reasons:
+            return False, "steady"
+        if (int(self.frame_idx) - int(self.last_reid_frame)) < int(self.reid_min_gap):
+            urgent = bool(new_raw_ids and self.lost)
+            if not urgent:
+                return False, "gap"
+        return True, "+".join(reasons)
+
+    def update(self, dets_boxmot: np.ndarray, frame_bgr: np.ndarray):
+        self.frame_idx += 1
+        self.last_reid_used = False
+        self.last_reid_reason = "steady"
+        self.last_reid_ms = 0.0
+        byte_t0 = time.perf_counter()
+        try:
+            byte_res = self.byte_tracker.update(dets_boxmot, frame_bgr)
+        except TypeError:
+            byte_res = self.byte_tracker.update(dets_boxmot)
+        except Exception:
+            self.errors += 1
+            raise
+        self.byte_runs += 1
+        self.last_byte_ms = (time.perf_counter() - byte_t0) * 1000.0
+        byte_tracks = boxmot_results_to_tracks(byte_res)
+        raw_ids = [_track_id(t) for t in byte_tracks if _track_id(t) >= 0]
+        new_raw_ids = [int(x) for x in raw_ids if int(x) not in self.byte_to_stable]
+
+        run_reid, reason = self._should_run_reid(dets_boxmot, byte_tracks, new_raw_ids)
+        strong_tracks: List[Any] = []
+        if run_reid and self.strong_tracker is not None:
+            reid_t0 = time.perf_counter()
+            try:
+                ss_res = self.strong_tracker.update(dets_boxmot, frame_bgr)
+            except TypeError:
+                ss_res = self.strong_tracker.update(dets_boxmot)
+            except Exception as exc:
+                self.errors += 1
+                self.last_reid_reason = f"reid_error:{exc}"
+                ss_res = None
+            self.last_reid_ms = (time.perf_counter() - reid_t0) * 1000.0
+            strong_tracks = boxmot_results_to_tracks(ss_res)
+            self.reid_runs += 1
+            self.last_reid_frame = int(self.frame_idx)
+            self.last_reid_used = True
+            self.last_reid_reason = str(reason)
+        else:
+            self.last_reid_reason = str(reason)
+
+        byte_to_ss = self._match_byte_to_strong(byte_tracks, strong_tracks) if strong_tracks else {}
+        prev_active = dict(self.active)
+        new_active: Dict[int, Dict[str, Any]] = {}
+        stable_by_raw: Dict[int, int] = {}
+        used_stable: set[int] = set()
+
+        for bt in byte_tracks:
+            raw_tid = _track_id(bt)
+            bbox = _track_xyxy(bt)
+            if raw_tid < 0 or bbox is None:
+                continue
+            stable_id = self.byte_to_stable.get(int(raw_tid))
+            ss_id = byte_to_ss.get(int(raw_tid))
+            if ss_id is not None and int(ss_id) in self.ss_to_stable:
+                stable_id = int(self.ss_to_stable[int(ss_id)])
+            if stable_id is None:
+                stable_id = self._recover_by_geometry(bbox)
+            if stable_id is None:
+                stable_id = self._new_stable_id()
+            if int(stable_id) in used_stable:
+                stable_id = self._new_stable_id()
+            used_stable.add(int(stable_id))
+            self.byte_to_stable[int(raw_tid)] = int(stable_id)
+            if ss_id is not None:
+                self.ss_to_stable[int(ss_id)] = int(stable_id)
+            stable_by_raw[int(raw_tid)] = int(stable_id)
+            new_active[int(stable_id)] = {
+                "bbox": tuple(float(v) for v in bbox),
+                "raw_tid": int(raw_tid),
+                "ss_id": int(ss_id) if ss_id is not None else None,
+                "last_frame": int(self.frame_idx),
+            }
+
+        for stable_id, old in prev_active.items():
+            if int(stable_id) not in new_active:
+                lost_item = dict(old or {})
+                lost_item["last_frame"] = int(old.get("last_frame", self.frame_idx - 1)) if isinstance(old, dict) else int(self.frame_idx - 1)
+                self.lost[int(stable_id)] = lost_item
+        self.active = new_active
+        self._cleanup()
+        self.last_output_tracks = int(len(stable_by_raw))
+
+        if self.log_enabled:
+            now_mono = time.monotonic()
+            should_log = bool(self.last_reid_used) or (now_mono - float(self._last_log_mono)) >= self.log_interval_s
+            if should_log:
+                self._last_log_mono = now_mono
+                try:
+                    print(
+                        f"[HYBRID][src={self.sid} cam={self.camera_id}] "
+                        f"frame={int(self.frame_idx)} dets={int(np.asarray(dets_boxmot).shape[0]) if dets_boxmot is not None else 0} "
+                        f"byte_tracks={len(byte_tracks)} stable={len(stable_by_raw)} lost={len(self.lost)} "
+                        f"reid={'RUN' if self.last_reid_used else 'skip'} reason={self.last_reid_reason} "
+                        f"byte_ms={self.last_byte_ms:.1f} reid_ms={self.last_reid_ms:.1f} matches={self.last_match_count} "
+                        f"runs={self.byte_runs}/{self.reid_runs}"
+                    )
+                except Exception:
+                    pass
+        return _tracks_to_boxmot_array(byte_tracks, stable_by_raw)
+
+
 def make_identity_entry() -> dict:
     return {
         "scores": defaultdict(float),
@@ -9816,6 +10129,8 @@ class BatchedYoloRunner:
         self.last_batch_size = 0
         self.max_seen_batch_size = 0
         self.last_infer_ms = 0.0
+        self.last_log_mono = 0.0
+        self.last_queue_size = 0
         self._thr.start()
 
     def close(self) -> None:
@@ -9913,6 +10228,21 @@ class BatchedYoloRunner:
                 self.batches += 1
                 self.last_batch_size = len(jobs)
                 self.max_seen_batch_size = max(self.max_seen_batch_size, len(jobs))
+                try:
+                    self.last_queue_size = int(self._q.qsize())
+                    log_enabled = bool(getattr(jobs[0].args, "log_yolo_inference", True))
+                    interval = float(max(0.2, float(getattr(jobs[0].args, "perf_log_interval", 2.0) or 2.0)))
+                    now_mono = time.monotonic()
+                    if log_enabled and (now_mono - float(self.last_log_mono)) >= interval:
+                        self.last_log_mono = now_mono
+                        print(
+                            f"[YOLO-BATCH] batch={len(jobs)} infer_ms={self.last_infer_ms:.1f} "
+                            f"submitted={self.submitted} completed={self.completed} batches={self.batches} "
+                            f"max_batch={self.max_seen_batch_size} q={self.last_queue_size} "
+                            f"imgsz={int(getattr(jobs[0].args, 'yolo_imgsz', 0) or 0)} half={bool(getattr(jobs[0].args, 'half', False))}"
+                        )
+                except Exception:
+                    pass
             except BaseException as exc:
                 self.errors += 1
                 for j in jobs:
@@ -12139,11 +12469,22 @@ def parse_args(argv: Optional[List[str]] = None):
     g.add_argument("--use-deepsort", action="store_true", help="Force DeepSORT")
     g.add_argument("--use-strongsort", action="store_true", help="Force StrongSORT (BoxMOT)")
     g.add_argument("--use-bytetrack", action="store_true", help="Force ByteTrack (BoxMOT)")
+    g.add_argument("--use-hybrid-tracker", action="store_true", help="Production mode: ByteTrack every frame + StrongSORT/ReID only for lost/occlusion/new-track recovery.")
 
     ap.add_argument("--strongsort-reid-weights", default=r"osnet_x1_0_msmt17.pt", help="ReID weights path for StrongSORT (BoxMOT).")
     ap.add_argument("--boxmot-device", choices=["auto", "cuda", "cpu"], default="auto", help="Device for BoxMOT/StrongSORT ReID. auto uses GPU unless --cuda-safe-mode is active with face CUDA.")
     ap.add_argument("--strongsort-every-n", type=int, default=3, help="A100 live mode: run expensive StrongSORT ReID every N processed frames and use the light IoU tracker between those frames. 1 = classic StrongSORT every frame.")
     ap.add_argument("--strongsort-skip-empty", action=argparse.BooleanOptionalAction, default=True, help="Skip expensive StrongSORT update on frames with zero person detections; light IoU aging still runs.")
+    ap.add_argument("--reid-recovery-enabled", action=argparse.BooleanOptionalAction, default=True, help="Hybrid mode: enable StrongSORT/ReID recovery for lost, occluded, new, or periodic tracks.")
+    ap.add_argument("--reid-recovery-every-n", type=int, default=12, help="Hybrid mode: sparse periodic StrongSORT/ReID refresh interval. 0 disables periodic refresh.")
+    ap.add_argument("--reid-recovery-min-gap-frames", type=int, default=4, help="Hybrid mode: minimum frames between non-urgent ReID recovery runs.")
+    ap.add_argument("--reid-recovery-lost-ttl", type=int, default=80, help="Hybrid mode: frames to keep lost stable IDs available for ReID/geometry recovery.")
+    ap.add_argument("--reid-recovery-match-iou", type=float, default=0.30, help="Hybrid mode: IoU threshold to match ByteTrack boxes with StrongSORT boxes on recovery frames.")
+    ap.add_argument("--reid-recovery-occlusion-iou", type=float, default=0.25, help="Hybrid mode: run ReID recovery when person detections overlap by this IoU.")
+    ap.add_argument("--reid-recovery-log", action=argparse.BooleanOptionalAction, default=True, help="Log hybrid ByteTrack/ReID recovery decisions to terminal.")
+    ap.add_argument("--perf-log-interval", type=float, default=2.0, help="Seconds between terminal performance summaries.")
+    ap.add_argument("--debug-log", action=argparse.BooleanOptionalAction, default=False, help="Verbose terminal logging for pipeline internals.")
+    ap.add_argument("--log-yolo-inference", action=argparse.BooleanOptionalAction, default=True, help="Log YOLO batch inference timing summaries to terminal.")
     ap.add_argument("--bytetrack-min-conf", type=float, default=0.10, help="ByteTrack: discard detections below this conf.")
     ap.add_argument("--bytetrack-track-thresh", type=float, default=0.45, help="ByteTrack: high-confidence threshold for first association.")
     ap.add_argument("--bytetrack-match-thresh", type=float, default=0.80, help="ByteTrack: matching threshold.")
@@ -12338,6 +12679,21 @@ def process_one_frame(
     dets_np = np.asarray(tlwh_conf, dtype=np.float32)
     if dets_np.ndim != 2:
         dets_np = dets_np.reshape((0, 5)).astype(np.float32)
+    try:
+        if bool(getattr(args, "log_yolo_inference", True)):
+            interval = float(max(0.2, float(getattr(args, "perf_log_interval", 2.0) or 2.0)))
+            key = f"_last_yolo_log_src_{int(sid)}"
+            now_mono = time.monotonic()
+            last_log = float(getattr(process_one_frame, key, 0.0) or 0.0)
+            if (now_mono - last_log) >= interval:
+                setattr(process_one_frame, key, now_mono)
+                print(
+                    f"[YOLO][src={sid} cam={camera_db_id}] frame={int(frame_idx)} "
+                    f"persons={len(tlwh_conf)} yolo_ms={float(timings_ms.get('yolo', 0.0)):.1f} "
+                    f"img={int(W)}x{int(H)} conf={float(getattr(args, 'conf', 0.0)):.2f} iou={float(getattr(args, 'iou', 0.0)):.2f}"
+                )
+    except Exception:
+        pass
     dets_dsrt = [([float(x), float(y), float(w), float(h)], float(cf), 0) for x, y, w, h, cf in tlwh_conf]
 
     out_tracks: List[Any] = []
@@ -12877,6 +13233,11 @@ def process_one_frame(
         "tracker_backend": str(tracker_backend),
         "strongsort_used": bool(strongsort_used),
         "strongsort_every_n": int(strongsort_every_n),
+        "hybrid_reid_used": bool(hybrid_reid_used),
+        "hybrid_reid_reason": str(hybrid_reid_reason),
+        "hybrid_byte_runs": int(getattr(deep_tracker, "byte_runs", 0) or 0) if deep_tracker is not None else 0,
+        "hybrid_reid_runs": int(getattr(deep_tracker, "reid_runs", 0) or 0) if deep_tracker is not None else 0,
+        "hybrid_lost": int(len(getattr(deep_tracker, "lost", {}) or {})) if deep_tracker is not None and hasattr(deep_tracker, "lost") else 0,
         "process_total_ms": float((time.perf_counter() - perf_t0) * 1000.0),
     }
     return out, meta
@@ -13422,7 +13783,9 @@ def main():
         print("[INIT] Async InsightFace worker: OFF (face recognition is synchronous)")
 
     tracker_backend = 'iou'
-    if bool(getattr(args, 'use_strongsort', False)):
+    if bool(getattr(args, 'use_hybrid_tracker', False)):
+        tracker_backend = 'hybrid'
+    elif bool(getattr(args, 'use_strongsort', False)):
         tracker_backend = 'strongsort'
     elif bool(getattr(args, 'use_bytetrack', False)):
         tracker_backend = 'bytetrack'
@@ -13431,13 +13794,14 @@ def main():
     elif bool(getattr(args, 'no_deepsort', False)):
         tracker_backend = 'iou'
     else:
-        if BoxByteTrack is not None:
+        if BoxByteTrack is not None and BoxStrongSort is not None and resolve_strongsort_reid_weights(args) is not None:
+            tracker_backend = 'hybrid'
+        elif BoxByteTrack is not None:
             tracker_backend = 'bytetrack'
         elif DeepSort is not None:
             tracker_backend = 'deepsort'
         else:
             tracker_backend = 'iou'
-
     strongsort_weights: Optional[Path] = None
     if tracker_backend == 'deepsort' and DeepSort is None:
         print('[WARN] DeepSORT selected but deep-sort-realtime not installed. Falling back to IoU tracker.')
@@ -13445,6 +13809,15 @@ def main():
     if tracker_backend == 'bytetrack' and BoxByteTrack is None:
         print('[WARN] ByteTrack selected but boxmot not installed. Falling back to IoU tracker.')
         tracker_backend = 'iou'
+    if tracker_backend == 'hybrid':
+        if BoxByteTrack is None or BoxStrongSort is None:
+            print('[WARN] Hybrid tracker selected but BoxMOT ByteTrack/StrongSORT is unavailable. Falling back to ByteTrack/IoU.')
+            tracker_backend = 'bytetrack' if BoxByteTrack is not None else 'iou'
+        else:
+            strongsort_weights = resolve_strongsort_reid_weights(args)
+            if strongsort_weights is None:
+                print('[WARN] Hybrid tracker selected but no StrongSORT ReID weights found. Falling back to ByteTrack.')
+                tracker_backend = 'bytetrack'
     if tracker_backend == 'strongsort':
         if BoxStrongSort is None:
             print('[WARN] StrongSORT selected but boxmot not installed. Falling back to IoU tracker.')
@@ -13455,8 +13828,8 @@ def main():
                 print('[WARN] StrongSORT selected but no ReID weights found. Falling back to IoU tracker.')
                 tracker_backend = 'iou'
     print(f'[INIT] Tracker backend: {tracker_backend}')
-    if tracker_backend == 'strongsort' and strongsort_weights is not None:
-        print(f'[INIT] StrongSORT ReID weights: {strongsort_weights}')
+    if tracker_backend in {'strongsort', 'hybrid'} and strongsort_weights is not None:
+        print(f'[INIT] StrongSORT/ReID recovery weights: {strongsort_weights}')
 
     normalized_data_writer = _create_normalized_data_writer(args)
     report, normalized_report, csv_stop_evt, csv_thread = _create_tracking_reports(
@@ -13528,6 +13901,36 @@ def main():
             except Exception as e:
                 print(f"[WARN] ByteTrack init failed for SRC {i}, fallback to IoU tracker:", e)
                 deep_tracker = None
+        elif tracker_backend == 'hybrid':
+            try:
+                byte_tracker = BoxByteTrack(
+                    det_thresh=float(args.conf), max_age=int(args.max_age), max_obs=max(50, int(args.max_age) + 5),
+                    min_hits=int(args.n_init), iou_threshold=float(getattr(args, 'max_iou_distance', 0.30)),
+                    min_conf=float(getattr(args, 'bytetrack_min_conf', 0.10)), track_thresh=float(getattr(args, 'bytetrack_track_thresh', 0.45)),
+                    match_thresh=float(getattr(args, 'bytetrack_match_thresh', 0.80)), track_buffer=int(getattr(args, 'bytetrack_track_buffer', 25)),
+                    frame_rate=int(getattr(args, 'bytetrack_frame_rate', 30)),
+                )
+                dev, ss_half, dev_label = resolve_boxmot_device(args, gpu)
+                print(f"[INIT] Hybrid ReID recovery device for SRC {i}: {dev_label} half={bool(ss_half)}")
+                strong_tracker = BoxStrongSort(
+                    reid_weights=strongsort_weights, device=dev, half=bool(ss_half),
+                    det_thresh=float(args.conf), max_age=int(args.max_age), max_obs=max(50, int(args.max_age) + 5),
+                    min_hits=int(args.n_init), iou_threshold=float(getattr(args, 'max_iou_distance', 0.30)),
+                    min_conf=float(args.conf), max_cos_dist=float(args.tracker_max_cosine), n_init=int(args.n_init), nn_budget=int(args.nn_budget),
+                )
+                deep_tracker = HybridByteTrackReIDTracker(byte_tracker, strong_tracker, args, sid=int(i), camera_id=int(camera_db_id))
+            except Exception as e:
+                print(f"[WARN] Hybrid tracker init failed for SRC {i}, fallback to ByteTrack/IoU tracker: {e}")
+                try:
+                    deep_tracker = BoxByteTrack(
+                        det_thresh=float(args.conf), max_age=int(args.max_age), max_obs=max(50, int(args.max_age) + 5),
+                        min_hits=int(args.n_init), iou_threshold=float(getattr(args, 'max_iou_distance', 0.30)),
+                        min_conf=float(getattr(args, 'bytetrack_min_conf', 0.10)), track_thresh=float(getattr(args, 'bytetrack_track_thresh', 0.45)),
+                        match_thresh=float(getattr(args, 'bytetrack_match_thresh', 0.80)), track_buffer=int(getattr(args, 'bytetrack_track_buffer', 25)),
+                        frame_rate=int(getattr(args, 'bytetrack_frame_rate', 30)),
+                    )
+                except Exception:
+                    deep_tracker = None
         elif tracker_backend == 'strongsort':
             try:
                 dev, ss_half, dev_label = resolve_boxmot_device(args, gpu)
@@ -14144,7 +14547,9 @@ class TrackingRunner:
                     samples_log_csv_path=samples_log_path,
                 )
         tracker_backend = 'iou'
-        if bool(getattr(args, 'use_strongsort', False)):
+        if bool(getattr(args, 'use_hybrid_tracker', False)):
+            tracker_backend = 'hybrid'
+        elif bool(getattr(args, 'use_strongsort', False)):
             tracker_backend = 'strongsort'
         elif bool(getattr(args, 'use_bytetrack', False)):
             tracker_backend = 'bytetrack'
@@ -14153,7 +14558,9 @@ class TrackingRunner:
         elif bool(getattr(args, 'no_deepsort', False)):
             tracker_backend = 'iou'
         else:
-            if BoxByteTrack is not None:
+            if BoxByteTrack is not None and BoxStrongSort is not None and resolve_strongsort_reid_weights(args) is not None:
+                tracker_backend = 'hybrid'
+            elif BoxByteTrack is not None:
                 tracker_backend = 'bytetrack'
             elif DeepSort is not None:
                 tracker_backend = 'deepsort'
@@ -14161,19 +14568,32 @@ class TrackingRunner:
                 tracker_backend = 'iou'
         strongsort_weights: Optional[Path] = None
         if tracker_backend == 'deepsort' and DeepSort is None:
+            print('[WARN] (service) DeepSORT selected but deep-sort-realtime not installed. Falling back to IoU tracker.')
             tracker_backend = 'iou'
         if tracker_backend == 'bytetrack' and BoxByteTrack is None:
+            print('[WARN] (service) ByteTrack selected but boxmot not installed. Falling back to IoU tracker.')
             tracker_backend = 'iou'
+        if tracker_backend == 'hybrid':
+            if BoxByteTrack is None or BoxStrongSort is None:
+                print('[WARN] (service) Hybrid tracker selected but BoxMOT ByteTrack/StrongSORT is unavailable. Falling back to ByteTrack/IoU.')
+                tracker_backend = 'bytetrack' if BoxByteTrack is not None else 'iou'
+            else:
+                strongsort_weights = resolve_strongsort_reid_weights(args)
+                if strongsort_weights is None:
+                    print('[WARN] (service) Hybrid tracker selected but no StrongSORT ReID weights found. Falling back to ByteTrack.')
+                    tracker_backend = 'bytetrack'
         if tracker_backend == 'strongsort':
             if BoxStrongSort is None:
+                print('[WARN] (service) StrongSORT selected but boxmot not installed. Falling back to IoU tracker.')
                 tracker_backend = 'iou'
             else:
                 strongsort_weights = resolve_strongsort_reid_weights(args)
                 if strongsort_weights is None:
+                    print('[WARN] (service) StrongSORT selected but no ReID weights found. Falling back to IoU tracker.')
                     tracker_backend = 'iou'
         print(f'[INIT] (service) Tracker backend: {tracker_backend}')
-        if tracker_backend == 'strongsort' and strongsort_weights is not None:
-            print(f'[INIT] (service) StrongSORT ReID weights: {strongsort_weights}')
+        if tracker_backend in {'strongsort', 'hybrid'} and strongsort_weights is not None:
+            print(f'[INIT] (service) StrongSORT/ReID recovery weights: {strongsort_weights}')
 
         self._streams = []
         self._render_by_cam = {}
@@ -14212,8 +14632,39 @@ class TrackingRunner:
                         match_thresh=float(getattr(args, 'bytetrack_match_thresh', 0.80)), track_buffer=int(getattr(args, 'bytetrack_track_buffer', 25)),
                         frame_rate=int(getattr(args, 'bytetrack_frame_rate', 30)),
                     )
-                except Exception:
+                except Exception as e:
+                    print(f"[WARN] (service) ByteTrack init failed for SRC {sid}, fallback to IoU tracker: {e}")
                     deep_tracker = None
+            elif tracker_backend == 'hybrid':
+                try:
+                    byte_tracker = BoxByteTrack(
+                        det_thresh=float(args.conf), max_age=int(args.max_age), max_obs=max(50, int(args.max_age) + 5),
+                        min_hits=int(args.n_init), iou_threshold=float(getattr(args, 'max_iou_distance', 0.30)),
+                        min_conf=float(getattr(args, 'bytetrack_min_conf', 0.10)), track_thresh=float(getattr(args, 'bytetrack_track_thresh', 0.45)),
+                        match_thresh=float(getattr(args, 'bytetrack_match_thresh', 0.80)), track_buffer=int(getattr(args, 'bytetrack_track_buffer', 25)),
+                        frame_rate=int(getattr(args, 'bytetrack_frame_rate', 30)),
+                    )
+                    dev, ss_half, dev_label = resolve_boxmot_device(args, gpu)
+                    print(f"[INIT] (service) Hybrid ReID recovery device for SRC {sid}: {dev_label} half={bool(ss_half)}")
+                    strong_tracker = BoxStrongSort(
+                        reid_weights=strongsort_weights, device=dev, half=bool(ss_half),
+                        det_thresh=float(args.conf), max_age=int(args.max_age), max_obs=max(50, int(args.max_age) + 5),
+                        min_hits=int(args.n_init), iou_threshold=float(getattr(args, 'max_iou_distance', 0.30)),
+                        min_conf=float(args.conf), max_cos_dist=float(args.tracker_max_cosine), n_init=int(args.n_init), nn_budget=int(args.nn_budget),
+                    )
+                    deep_tracker = HybridByteTrackReIDTracker(byte_tracker, strong_tracker, args, sid=int(sid), camera_id=int(camera_db_id))
+                except Exception as e:
+                    print(f"[WARN] (service) Hybrid tracker init failed for SRC {sid}, fallback to ByteTrack/IoU tracker: {e}")
+                    try:
+                        deep_tracker = BoxByteTrack(
+                            det_thresh=float(args.conf), max_age=int(args.max_age), max_obs=max(50, int(args.max_age) + 5),
+                            min_hits=int(args.n_init), iou_threshold=float(getattr(args, 'max_iou_distance', 0.30)),
+                            min_conf=float(getattr(args, 'bytetrack_min_conf', 0.10)), track_thresh=float(getattr(args, 'bytetrack_track_thresh', 0.45)),
+                            match_thresh=float(getattr(args, 'bytetrack_match_thresh', 0.80)), track_buffer=int(getattr(args, 'bytetrack_track_buffer', 25)),
+                            frame_rate=int(getattr(args, 'bytetrack_frame_rate', 30)),
+                        )
+                    except Exception:
+                        deep_tracker = None
             elif tracker_backend == 'strongsort':
                 try:
                     dev, ss_half, dev_label = resolve_boxmot_device(args, gpu)
@@ -14396,6 +14847,21 @@ class TrackingRunner:
 
     def status(self) -> Dict[str, Any]:
         cams = sorted(list(self._render_by_cam.keys()))
+        hybrid_stats: Dict[int, Dict[str, Any]] = {}
+        for item in self._streams:
+            cam_id = int(item.get("camera_db_id", -1))
+            trk = item.get("deep")
+            if trk is not None and str(getattr(trk, "_pipeline_backend", "")) == "hybrid":
+                hybrid_stats[cam_id] = {
+                    "byte_runs": int(getattr(trk, "byte_runs", 0) or 0),
+                    "reid_runs": int(getattr(trk, "reid_runs", 0) or 0),
+                    "last_reid_used": bool(getattr(trk, "last_reid_used", False)),
+                    "last_reid_reason": str(getattr(trk, "last_reid_reason", "") or ""),
+                    "last_byte_ms": float(getattr(trk, "last_byte_ms", 0.0) or 0.0),
+                    "last_reid_ms": float(getattr(trk, "last_reid_ms", 0.0) or 0.0),
+                    "lost": int(len(getattr(trk, "lost", {}) or {})),
+                    "errors": int(getattr(trk, "errors", 0) or 0),
+                }
         return {
             "running": bool(self._started),
             "camera_ids": cams,
@@ -14420,6 +14886,10 @@ class TrackingRunner:
             },
             "strongsort_every_n": int(getattr(self.args, "strongsort_every_n", 1) or 1),
             "strongsort_skip_empty": bool(getattr(self.args, "strongsort_skip_empty", True)),
+            "hybrid_tracker": bool(getattr(self.args, "use_hybrid_tracker", False)) or bool(hybrid_stats),
+            "hybrid_stats": hybrid_stats,
+            "reid_recovery_every_n": int(getattr(self.args, "reid_recovery_every_n", 0) or 0),
+            "reid_recovery_min_gap_frames": int(getattr(self.args, "reid_recovery_min_gap_frames", 0) or 0),
             "yolo_cuda_stream": bool(getattr(self.args, "yolo_cuda_stream", False)),
             "save_video": bool(getattr(self.args, "save_video", True)),
             "video_dir": str(getattr(self._seg_writer, "run_dir", "") or ""),
@@ -14796,6 +15266,17 @@ def process_one_frame(
     else:
         out_tracks = iou_tracker.update(dets_np)
     timings_ms["tracker"] = (time.perf_counter() - tracker_t0) * 1000.0
+    hybrid_reid_used = False
+    hybrid_reid_reason = ""
+    if deep_tracker is not None and str(getattr(deep_tracker, "_pipeline_backend", "")) == "hybrid":
+        hybrid_reid_used = bool(getattr(deep_tracker, "last_reid_used", False))
+        hybrid_reid_reason = str(getattr(deep_tracker, "last_reid_reason", "") or "")
+        strongsort_used = bool(hybrid_reid_used)
+        try:
+            timings_ms["bytetrack"] = float(getattr(deep_tracker, "last_byte_ms", 0.0) or 0.0)
+            timings_ms["reid_recovery"] = float(getattr(deep_tracker, "last_reid_ms", 0.0) or 0.0)
+        except Exception:
+            pass
 
     recognized_faces: List[Dict[str, Any]] = []
     low_faces: List[Dict[str, Any]] = []
@@ -15384,6 +15865,11 @@ def process_one_frame(
         "tracker_backend": str(tracker_backend),
         "strongsort_used": bool(strongsort_used),
         "strongsort_every_n": int(strongsort_every_n),
+        "hybrid_reid_used": bool(hybrid_reid_used),
+        "hybrid_reid_reason": str(hybrid_reid_reason),
+        "hybrid_byte_runs": int(getattr(deep_tracker, "byte_runs", 0) or 0) if deep_tracker is not None else 0,
+        "hybrid_reid_runs": int(getattr(deep_tracker, "reid_runs", 0) or 0) if deep_tracker is not None else 0,
+        "hybrid_lost": int(len(getattr(deep_tracker, "lost", {}) or {})) if deep_tracker is not None and hasattr(deep_tracker, "lost") else 0,
         "process_total_ms": float((time.perf_counter() - perf_t0) * 1000.0),
     }
     return out, meta

@@ -598,9 +598,16 @@ class ProcessedFrameRtspPublisher:
                 total_ms = float((meta or {}).get("process_total_ms", 0.0) or 0.0)
             except Exception:
                 yolo_ms = trk_ms = total_ms = 0.0
+            tracker_backend = str((meta or {}).get("tracker_backend", "") or "")
             ss_every = int((meta or {}).get("strongsort_every_n", 1) or 1)
             ss_used = bool((meta or {}).get("strongsort_used", False))
-            ss_txt = f"SS {('hit' if ss_used else 'skip')}/{ss_every}" if ss_every > 1 else ("SS" if ss_used else "trk")
+            if tracker_backend == "hybrid":
+                hy_used = bool((meta or {}).get("hybrid_reid_used", False))
+                hy_reason = str((meta or {}).get("hybrid_reid_reason", "") or "")
+                hy_lost = int((meta or {}).get("hybrid_lost", 0) or 0)
+                ss_txt = f"BT+ReID {('hit' if hy_used else 'skip')} {hy_reason} lost={hy_lost}".strip()
+            else:
+                ss_txt = f"SS {('hit' if ss_used else 'skip')}/{ss_every}" if ss_every > 1 else ("SS" if ss_used else "trk")
             lines = [
                 f"AI FPS {pipe_fps:.1f} | WebRTC FPS {webrtc_fps:.1f} | {source}",
                 f"tracks {tracks} | shown {shown} | lag {lag_ms:.0f}ms",

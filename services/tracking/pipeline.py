@@ -9389,6 +9389,34 @@ class IOUTracker:
         self.max_miss = int(max_miss)
         self.iou_thresh = float(iou_thresh)
 
+    def sync_from_tracks(self, tracks: List[Any]) -> None:
+        """Seed the light CPU IoU tracker from heavyweight tracker output.
+
+        In A100 live mode we run expensive StrongSORT ReID periodically and use
+        this light tracker on the in-between frames.  Syncing keeps the visible
+        track IDs stable while avoiding a ReID crop forward pass on every frame.
+        """
+        synced: list[IOUTrack] = []
+        max_tid = 0
+        for t in tracks or []:
+            try:
+                if hasattr(t, "to_tlbr"):
+                    x1, y1, x2, y2 = map(float, t.to_tlbr())
+                elif hasattr(t, "to_ltrb"):
+                    x1, y1, x2, y2 = map(float, t.to_ltrb())
+                else:
+                    x1, y1, x2, y2 = map(float, getattr(t, "tlbr"))
+                tid = int(getattr(t, "track_id", getattr(t, "track_id_", -1)))
+                if tid < 0 or x2 <= x1 or y2 <= y1:
+                    continue
+                synced.append(IOUTrack([x1, y1, x2 - x1, y2 - y1], tid))
+                max_tid = max(max_tid, tid)
+            except Exception:
+                continue
+        if synced:
+            self.tracks = synced
+            self.next_id = max(int(self.next_id), int(max_tid) + 1)
+
     def update(self, dets_tlwh_conf: np.ndarray):
         dets = np.asarray(dets_tlwh_conf, dtype=np.float32)
         if dets.ndim != 2 or dets.shape[1] < 4:
@@ -9767,10 +9795,17 @@ class BatchedYoloRunner:
     camera frames as a batch instead of four serialized batch=1 calls.
     """
 
-    def __init__(self, model: Any, *, max_batch_size: int = 4, max_wait_ms: float = 6.0):
+    def __init__(self, model: Any, *, max_batch_size: int = 4, max_wait_ms: float = 6.0, use_cuda_stream: bool = False):
         self.model = model
         self.max_batch_size = int(max(1, int(max_batch_size or 1)))
         self.max_wait_s = float(max(0.0, float(max_wait_ms or 0.0))) / 1000.0
+        self.use_cuda_stream = bool(use_cuda_stream)
+        self._cuda_stream = None
+        if self.use_cuda_stream and torch.cuda.is_available():
+            try:
+                self._cuda_stream = torch.cuda.Stream()
+            except Exception:
+                self._cuda_stream = None
         self._q: queue.Queue = queue.Queue(maxsize=max(8, self.max_batch_size * 8))
         self._stop = threading.Event()
         self._thr = threading.Thread(target=self._loop, name="batched-yolo-worker", daemon=True)
@@ -9825,11 +9860,24 @@ class BatchedYoloRunner:
         )
         if imgsz > 0:
             kwargs["imgsz"] = imgsz
-        try:
-            return self.model(frames, **kwargs)
-        except TypeError:
-            kwargs.pop("imgsz", None)
-            return self.model(frames, **kwargs)
+        def _call_model(call_kwargs):
+            try:
+                return self.model(frames, **call_kwargs)
+            except TypeError:
+                call_kwargs = dict(call_kwargs)
+                call_kwargs.pop("imgsz", None)
+                return self.model(frames, **call_kwargs)
+
+        # Optional PyTorch CUDA stream.  This is deliberately guarded and
+        # synchronized before returning because Ultralytics returns tensors that
+        # the CPU side reads immediately.  It gives the scheduler a separate
+        # stream without risking stale tensor reads.
+        if self._cuda_stream is not None and torch.cuda.is_available():
+            with torch.cuda.stream(self._cuda_stream):
+                out = _call_model(kwargs)
+            self._cuda_stream.synchronize()
+            return out
+        return _call_model(kwargs)
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -12060,6 +12108,7 @@ def parse_args(argv: Optional[List[str]] = None):
     ap.add_argument("--yolo-batch-size", type=int, default=4, help="Max frames per YOLO batch when --yolo-batch is enabled.")
     ap.add_argument("--yolo-batch-wait-ms", type=float, default=6.0, help="Max wait to form a YOLO batch. 3-8ms is usually best for live streams.")
     ap.add_argument("--yolo-batch-timeout-s", type=float, default=3.0, help="Safety timeout for a queued YOLO batch job.")
+    ap.add_argument("--yolo-cuda-stream", action=argparse.BooleanOptionalAction, default=False, help="Run the batched YOLO worker inside its own PyTorch CUDA stream. Experimental; off by default for maximum library compatibility.")
     ap.add_argument("--serialize-yolo", action=argparse.BooleanOptionalAction, default=False, help="Force a global YOLO lock. Safer but slower; normally off in cloud mode.")
     ap.add_argument("--cuda-safe-mode", action=argparse.BooleanOptionalAction, default=False, help="Debug/stability mode: serialize/synchronize CUDA sections. Slower; use only if CUDA faults return.")
     ap.add_argument("--opencv-threads", type=int, default=1, help="OpenCV CPU worker threads. Keep low for multi-camera cloud inference.")
@@ -12093,6 +12142,8 @@ def parse_args(argv: Optional[List[str]] = None):
 
     ap.add_argument("--strongsort-reid-weights", default=r"osnet_x1_0_msmt17.pt", help="ReID weights path for StrongSORT (BoxMOT).")
     ap.add_argument("--boxmot-device", choices=["auto", "cuda", "cpu"], default="auto", help="Device for BoxMOT/StrongSORT ReID. auto uses GPU unless --cuda-safe-mode is active with face CUDA.")
+    ap.add_argument("--strongsort-every-n", type=int, default=3, help="A100 live mode: run expensive StrongSORT ReID every N processed frames and use the light IoU tracker between those frames. 1 = classic StrongSORT every frame.")
+    ap.add_argument("--strongsort-skip-empty", action=argparse.BooleanOptionalAction, default=True, help="Skip expensive StrongSORT update on frames with zero person detections; light IoU aging still runs.")
     ap.add_argument("--bytetrack-min-conf", type=float, default=0.10, help="ByteTrack: discard detections below this conf.")
     ap.add_argument("--bytetrack-track-thresh", type=float, default=0.45, help="ByteTrack: high-confidence threshold for first association.")
     ap.add_argument("--bytetrack-match-thresh", type=float, default=0.80, help="ByteTrack: matching threshold.")
@@ -12383,6 +12434,8 @@ def process_one_frame(
                         })
         except Exception as e:
             print(f"[SRC {sid}] FaceAnalysis error:", e)
+        finally:
+            timings_ms["face_sync"] = (time.perf_counter() - face_t0) * 1000.0
 
     out = frame_bgr.copy()
     tracks_info: List[Dict[str, Any]] = []
@@ -12820,6 +12873,11 @@ def process_one_frame(
         "frame_height": int(H),
         "present_names": present_names,
         "present_conf": present_conf,
+        "timings_ms": {k: float(v) for k, v in dict(timings_ms).items()},
+        "tracker_backend": str(tracker_backend),
+        "strongsort_used": bool(strongsort_used),
+        "strongsort_every_n": int(strongsort_every_n),
+        "process_total_ms": float((time.perf_counter() - perf_t0) * 1000.0),
     }
     return out, meta
 
@@ -14042,6 +14100,7 @@ class TrackingRunner:
                     yolo,
                     max_batch_size=int(getattr(args, "yolo_batch_size", 4) or 4),
                     max_wait_ms=float(getattr(args, "yolo_batch_wait_ms", 6.0) or 6.0),
+                    use_cuda_stream=bool(getattr(args, "yolo_cuda_stream", False)),
                 )
                 print(f"[INIT] (service) Batched YOLO: ON batch_size={int(getattr(args, 'yolo_batch_size', 4) or 4)} wait_ms={float(getattr(args, 'yolo_batch_wait_ms', 6.0) or 6.0):.1f}")
             except Exception as e:
@@ -14167,6 +14226,11 @@ class TrackingRunner:
                     )
                 except Exception:
                     deep_tracker = None
+            if deep_tracker is not None:
+                try:
+                    setattr(deep_tracker, "_pipeline_backend", str(tracker_backend))
+                except Exception:
+                    pass
             iou_tracker = IOUTracker(max_miss=max(1, int(args.iou_max_miss)), iou_thresh=float(getattr(args, 'max_iou_distance', 0.30)))
             buf = RenderedFrame()
             self._render_by_cam[int(camera_db_id)] = buf
@@ -14336,7 +14400,7 @@ class TrackingRunner:
             "running": bool(self._started),
             "camera_ids": cams,
             "num_cameras": len(cams),
-            "latest_only": False,
+            "latest_only": bool(getattr(self.args, "latest_frame_only", True)),
             "capture_queue_dropped_oldest": {int(x.get("camera_db_id", -1)): int(getattr(x.get("vs", None), "dropped", 0)) for x in self._streams},
             "save_csv": bool(getattr(self.args, "save_csv", False)),
             "csv_path": str(getattr(self.args, "csv", "") or ""),
@@ -14354,6 +14418,9 @@ class TrackingRunner:
                 "last_infer_ms": float(getattr(self._yolo, "last_infer_ms", 0.0) or 0.0),
                 "errors": int(getattr(self._yolo, "errors", 0) or 0),
             },
+            "strongsort_every_n": int(getattr(self.args, "strongsort_every_n", 1) or 1),
+            "strongsort_skip_empty": bool(getattr(self.args, "strongsort_skip_empty", True)),
+            "yolo_cuda_stream": bool(getattr(self.args, "yolo_cuda_stream", False)),
             "save_video": bool(getattr(self.args, "save_video", True)),
             "video_dir": str(getattr(self._seg_writer, "run_dir", "") or ""),
         }
@@ -14657,12 +14724,18 @@ def process_one_frame(
         frame_bgr = cv2.resize(frame_bgr, (rw, rh), interpolation=cv2.INTER_LINEAR)
     H, W = frame_bgr.shape[:2]
 
+    perf_t0 = time.perf_counter()
+    timings_ms: Dict[str, float] = {}
     tlwh_conf: list[list[float]] = []
     if yolo is not None:
+        yolo_t0 = time.perf_counter()
         try:
             res = _yolo_forward_safe(yolo, frame_bgr, args)
+            timings_ms["yolo"] = (time.perf_counter() - yolo_t0) * 1000.0
             boxes = res[0].boxes if (res and len(res)) else None
             if boxes is not None:
+                # This CPU read is the required synchronization point for the
+                # detection tensor. Keep it compact and do all filtering in NumPy.
                 xyxy = boxes.xyxy.detach().cpu().numpy().astype(np.float32)
                 conf = boxes.conf.detach().cpu().numpy().astype(np.float32)
                 cls = boxes.cls.detach().cpu().numpy().astype(np.int32)
@@ -14679,6 +14752,7 @@ def process_one_frame(
                         continue
                     tlwh_conf.append([x1f, y1f, ww, hh, float(c)])
         except Exception as e:
+            timings_ms["yolo"] = (time.perf_counter() - yolo_t0) * 1000.0
             print(f"[SRC {sid}] YOLO error:", e)
 
     dets_np = np.asarray(tlwh_conf, dtype=np.float32)
@@ -14687,7 +14761,13 @@ def process_one_frame(
     dets_dsrt = [([float(x), float(y), float(w), float(h)], float(cf), 0) for x, y, w, h, cf in tlwh_conf]
 
     out_tracks: List[Any] = []
-    if deep_tracker is not None:
+    tracker_t0 = time.perf_counter()
+    tracker_backend = str(getattr(deep_tracker, "_pipeline_backend", "") or "") if deep_tracker is not None else "iou"
+    strongsort_every_n = max(1, int(getattr(args, "strongsort_every_n", 1) or 1))
+    strongsort_periodic_skip = (tracker_backend == "strongsort" and strongsort_every_n > 1 and (int(frame_idx) % strongsort_every_n) != 0)
+    strongsort_empty_skip = (tracker_backend == "strongsort" and bool(getattr(args, "strongsort_skip_empty", True)) and len(tlwh_conf) == 0)
+    strongsort_used = False
+    if deep_tracker is not None and not strongsort_periodic_skip and not strongsort_empty_skip:
         if hasattr(deep_tracker, 'update_tracks'):
             try:
                 out_tracks = deep_tracker.update_tracks(dets_dsrt, frame=frame_bgr)
@@ -14702,6 +14782,12 @@ def process_one_frame(
                     dets_boxmot = np.zeros((0, 6), dtype=np.float32)
                 res_mot = deep_tracker.update(dets_boxmot, frame_bgr)
                 out_tracks = boxmot_results_to_tracks(res_mot)
+                strongsort_used = (tracker_backend == "strongsort")
+                if strongsort_used and hasattr(iou_tracker, "sync_from_tracks"):
+                    try:
+                        iou_tracker.sync_from_tracks(out_tracks)
+                    except Exception:
+                        pass
             except Exception as e:
                 print(f"[SRC {sid}] BoxMOT tracker update error:", e)
                 out_tracks = iou_tracker.update(dets_np)
@@ -14709,12 +14795,14 @@ def process_one_frame(
             out_tracks = iou_tracker.update(dets_np)
     else:
         out_tracks = iou_tracker.update(dets_np)
+    timings_ms["tracker"] = (time.perf_counter() - tracker_t0) * 1000.0
 
     recognized_faces: List[Dict[str, Any]] = []
     low_faces: List[Dict[str, Any]] = []
     async_face_enabled = bool(getattr(args, "async_face", True)) and (async_face_worker is not None)
     do_face = face_app is not None and face_gallery is not None and (not face_gallery.is_empty()) and (frame_idx % max(1, int(args.face_every_n)) == 0)
     if do_face and (not async_face_enabled):
+        face_t0 = time.perf_counter()
         try:
             det_min = float(getattr(args, "embed_min_face_det_score", 0.75))
             with _face_lock:
@@ -14762,6 +14850,8 @@ def process_one_frame(
                         })
         except Exception as e:
             print(f"[SRC {sid}] FaceAnalysis error:", e)
+        finally:
+            timings_ms["face_sync"] = (time.perf_counter() - face_t0) * 1000.0
 
     out = frame_bgr.copy()
     tracks_info: List[Dict[str, Any]] = []
@@ -15290,6 +15380,11 @@ def process_one_frame(
         "frame_height": int(H),
         "present_names": present_names,
         "present_conf": present_conf,
+        "timings_ms": {k: float(v) for k, v in dict(timings_ms).items()},
+        "tracker_backend": str(tracker_backend),
+        "strongsort_used": bool(strongsort_used),
+        "strongsort_every_n": int(strongsort_every_n),
+        "process_total_ms": float((time.perf_counter() - perf_t0) * 1000.0),
     }
     return out, meta
 

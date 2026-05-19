@@ -591,9 +591,20 @@ class ProcessedFrameRtspPublisher:
                 lag_ms = max(0.0, (time.time() - cap_ts) * 1000.0)
 
             webrtc_fps = float(self._publish_fps_ema or self.fps)
+            timings = (meta or {}).get("timings_ms") or {}
+            try:
+                yolo_ms = float(timings.get("yolo", 0.0) or 0.0)
+                trk_ms = float(timings.get("tracker", 0.0) or 0.0)
+                total_ms = float((meta or {}).get("process_total_ms", 0.0) or 0.0)
+            except Exception:
+                yolo_ms = trk_ms = total_ms = 0.0
+            ss_every = int((meta or {}).get("strongsort_every_n", 1) or 1)
+            ss_used = bool((meta or {}).get("strongsort_used", False))
+            ss_txt = f"SS {('hit' if ss_used else 'skip')}/{ss_every}" if ss_every > 1 else ("SS" if ss_used else "trk")
             lines = [
                 f"AI FPS {pipe_fps:.1f} | WebRTC FPS {webrtc_fps:.1f} | {source}",
                 f"tracks {tracks} | shown {shown} | lag {lag_ms:.0f}ms",
+                f"yolo {yolo_ms:.0f}ms | trk {trk_ms:.0f}ms | total {total_ms:.0f}ms | {ss_txt}",
             ]
             font = cv2.FONT_HERSHEY_SIMPLEX
             scale = max(0.45, min(0.7, w / 1300.0))

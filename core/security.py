@@ -1,0 +1,22 @@
+from passlib.context import CryptContext
+import hashlib
+
+pwd_context = CryptContext(
+    schemes=["bcrypt"],
+    deprecated="auto"
+)
+
+def hash_password(password: str) -> str:
+    # Normalize
+    password = password.strip()
+
+    # Pre-hash with SHA-256 (FIXES 72-byte limit)
+    digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+    # bcrypt the digest
+    return pwd_context.hash(digest)
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    digest = hashlib.sha256(plain_password.encode("utf-8")).hexdigest()
+    return pwd_context.verify(digest, hashed_password)

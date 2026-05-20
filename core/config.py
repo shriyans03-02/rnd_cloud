@@ -137,6 +137,28 @@ class Settings(BaseSettings):
     TRACKING_WEBRTC_AUTOSTART: bool = False
     TRACKING_WEBRTC_MAX_ACTIVE_PUBLISHERS: int = 0  # 0 = unlimited; set 4/6 if CPU is tight
 
+    # Playback tracing stability settings.
+    # Playback is on-demand and can run while the 12-camera live pipeline is already using CUDA.
+    # Keep playback CPU-safe by default to avoid cross-framework CUDA/cudNN crashes.
+    PLAYBACK_DEVICE: str = "cpu"
+    PLAYBACK_YOLO_WEIGHTS: str = "yolov8n.pt"
+    PLAYBACK_YOLO_IMGSZ: int = 640
+    PLAYBACK_CONF: float = 0.30
+    PLAYBACK_IOU: float = 0.45
+    PLAYBACK_HALF: bool = False
+    PLAYBACK_CUDNN_BENCHMARK: bool = False
+    PLAYBACK_TRACKER_BACKEND: str = "iou"  # iou, bytetrack, deepsort, strongsort
+    PLAYBACK_USE_FACE: bool = True
+    PLAYBACK_FACE_PROVIDER: str = "cpu"  # cpu is safest while live CUDA pipeline is running
+    PLAYBACK_FACE_DET_SIZE: str = "640 640"
+    PLAYBACK_FACE_EVERY_N: int = 5
+    PLAYBACK_VIDEO_FPS: float = 20.0
+    PLAYBACK_QUEUE_SIZE: int = 256
+    PLAYBACK_STREAM_FREEZE_SECONDS: float = 300.0
+    PLAYBACK_STREAM_OPEN_TIMEOUT_MS: int = 8000
+    PLAYBACK_STREAM_READ_TIMEOUT_MS: int = 8000
+    PLAYBACK_MAX_ACTIVE_SESSIONS: int = 1
+
     # Camera channel map, e.g. "11:101,12:301,10:201,9:401"
     CHANNEL_MAP: str = ""
 

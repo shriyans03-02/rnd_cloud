@@ -40,6 +40,11 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit, quote, unquote
 
+# Disable CUDA graph capture by default.  Playback tracing can be started while
+# the live pipeline is already running PyTorch YOLO and ONNX InsightFace; CUDA
+# graph capture has caused cross-framework crashes in this mixed workload.
+os.environ.setdefault("TORCH_CUDAGRAPH_ENABLE", "0")
+
 import cv2
 import numpy as np
 import torch
@@ -1841,16 +1846,26 @@ def init_face_engine(use_face: bool, device: str, face_model: str, det_w: int, d
             except Exception:
                 pass
         providers = ["CPUExecutionProvider"]
+        cuda_provider = (
+            "CUDAExecutionProvider",
+            {
+                "device_id": "0",
+                "enable_cuda_graph": "0",
+                "do_copy_in_default_stream": "1",
+                "cudnn_conv_algo_search": "HEURISTIC",
+            },
+        )
         if face_provider == "cuda":
             if cuda_ok:
-                providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                providers = [cuda_provider, "CPUExecutionProvider"]
             else:
                 print("[INFO] Requested CUDA EP, but not loadable. Using CPU.")
         elif face_provider == "auto":
             if is_cuda and cuda_ok:
-                providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                providers = [cuda_provider, "CPUExecutionProvider"]
         app = FaceAnalysis(name=face_model, providers=providers)
-        ctx_id = 0 if providers[0].startswith("CUDA") else -1
+        first_provider = providers[0][0] if isinstance(providers[0], tuple) else str(providers[0])
+        ctx_id = 0 if first_provider.startswith("CUDA") else -1
         try:
             app.prepare(ctx_id=ctx_id, det_size=(det_w, det_h))
         except TypeError:

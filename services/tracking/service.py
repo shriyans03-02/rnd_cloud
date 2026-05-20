@@ -787,6 +787,113 @@ class PlaybackTracingService:
             return "location"
         return mode
 
+    @staticmethod
+    def _env_bool(name: str, default: bool) -> bool:
+        raw = os.environ.get(str(name))
+        if raw is None:
+            return bool(default)
+        return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+    @staticmethod
+    def _parse_face_det_size(value: Any, default: tuple[int, int] = (640, 640)) -> list[int]:
+        try:
+            if isinstance(value, (list, tuple)) and len(value) >= 2:
+                return [int(value[0]), int(value[1])]
+            text = str(value or "").replace(",", " ").strip()
+            parts = [p for p in text.split() if p]
+            if len(parts) >= 2:
+                return [max(64, int(parts[0])), max(64, int(parts[1]))]
+        except Exception:
+            pass
+        return [int(default[0]), int(default[1])]
+
+    def _apply_playback_stability_overrides(self, args: argparse.Namespace) -> None:
+        """
+        Playback tracing runs on demand while the continuous live camera pipeline
+        may already be using CUDA/ONNX/cuDNN.  Starting another CUDA YOLO +
+        InsightFace + DeepSORT stack in the same process can trigger errors like:
+
+            CUDA error: operation not permitted when stream is capturing
+            cuDNN error: CUDNN_STATUS_EXECUTION_FAILED
+            Segmentation fault
+
+        Use CPU-safe playback defaults unless explicitly overridden.  The live
+        pipeline can remain GPU/batched; only finite playback tracing is moved
+        to the safer profile.
+        """
+        device = str(getattr(settings, "PLAYBACK_DEVICE", "cpu") or os.environ.get("PLAYBACK_DEVICE", "cpu") or "cpu").strip()
+        if not device:
+            device = "cpu"
+        args.device = device
+
+        yolo_weights = str(getattr(settings, "PLAYBACK_YOLO_WEIGHTS", "") or os.environ.get("PLAYBACK_YOLO_WEIGHTS", "") or "").strip()
+        if yolo_weights:
+            args.yolo_weights = yolo_weights
+        try:
+            args.yolo_imgsz = int(getattr(settings, "PLAYBACK_YOLO_IMGSZ", 640) or os.environ.get("PLAYBACK_YOLO_IMGSZ", 640) or 640)
+        except Exception:
+            args.yolo_imgsz = 640
+        try:
+            args.conf = float(getattr(settings, "PLAYBACK_CONF", 0.30) or os.environ.get("PLAYBACK_CONF", 0.30) or 0.30)
+        except Exception:
+            args.conf = 0.30
+        try:
+            args.iou = float(getattr(settings, "PLAYBACK_IOU", 0.45) or os.environ.get("PLAYBACK_IOU", 0.45) or 0.45)
+        except Exception:
+            args.iou = 0.45
+
+        use_cuda = str(device).lower().startswith("cuda")
+        half_default = bool(getattr(settings, "PLAYBACK_HALF", False))
+        args.half = bool(use_cuda and self._env_bool("PLAYBACK_HALF", half_default))
+        args.cudnn_benchmark = bool(use_cuda and self._env_bool("PLAYBACK_CUDNN_BENCHMARK", bool(getattr(settings, "PLAYBACK_CUDNN_BENCHMARK", False))))
+
+        # Avoid GPU embedding trackers by default.  For playback, IOU/ByteTrack is
+        # enough to draw boxes; face recognition performs identity matching.
+        tracker_backend = str(getattr(settings, "PLAYBACK_TRACKER_BACKEND", "iou") or os.environ.get("PLAYBACK_TRACKER_BACKEND", "iou") or "iou").strip().lower()
+        for attr in ("no_deepsort", "use_deepsort", "use_strongsort", "use_bytetrack"):
+            if hasattr(args, attr):
+                setattr(args, attr, False)
+        if tracker_backend == "deepsort" and hasattr(args, "use_deepsort"):
+            args.use_deepsort = True
+        elif tracker_backend == "strongsort" and hasattr(args, "use_strongsort"):
+            args.use_strongsort = True
+        elif tracker_backend == "bytetrack" and hasattr(args, "use_bytetrack"):
+            args.use_bytetrack = True
+        elif hasattr(args, "no_deepsort"):
+            args.no_deepsort = True
+
+        use_face_default = bool(getattr(settings, "PLAYBACK_USE_FACE", True))
+        args.use_face = self._env_bool("PLAYBACK_USE_FACE", use_face_default)
+        args.face_provider = str(getattr(settings, "PLAYBACK_FACE_PROVIDER", "cpu") or os.environ.get("PLAYBACK_FACE_PROVIDER", "cpu") or "cpu").strip().lower()
+        if args.face_provider not in {"auto", "cuda", "cpu"}:
+            args.face_provider = "cpu"
+        args.face_det_size = self._parse_face_det_size(getattr(settings, "PLAYBACK_FACE_DET_SIZE", "640 640"), default=(640, 640))
+        try:
+            args.face_every_n = max(1, int(getattr(settings, "PLAYBACK_FACE_EVERY_N", 5) or os.environ.get("PLAYBACK_FACE_EVERY_N", 5) or 5))
+        except Exception:
+            args.face_every_n = 5
+
+        try:
+            args.video_fps = float(getattr(settings, "PLAYBACK_VIDEO_FPS", 20.0) or os.environ.get("PLAYBACK_VIDEO_FPS", 20.0) or 20.0)
+        except Exception:
+            args.video_fps = 20.0
+        try:
+            args.queue_size = max(16, int(getattr(settings, "PLAYBACK_QUEUE_SIZE", 256) or os.environ.get("PLAYBACK_QUEUE_SIZE", 256) or 256))
+        except Exception:
+            args.queue_size = 256
+        try:
+            args.stream_freeze_seconds = max(30.0, float(getattr(settings, "PLAYBACK_STREAM_FREEZE_SECONDS", 300.0) or os.environ.get("PLAYBACK_STREAM_FREEZE_SECONDS", 300.0) or 300.0))
+        except Exception:
+            args.stream_freeze_seconds = 300.0
+        try:
+            args.stream_open_timeout_ms = int(getattr(settings, "PLAYBACK_STREAM_OPEN_TIMEOUT_MS", 8000) or os.environ.get("PLAYBACK_STREAM_OPEN_TIMEOUT_MS", 8000) or 8000)
+        except Exception:
+            args.stream_open_timeout_ms = 8000
+        try:
+            args.stream_read_timeout_ms = int(getattr(settings, "PLAYBACK_STREAM_READ_TIMEOUT_MS", 8000) or os.environ.get("PLAYBACK_STREAM_READ_TIMEOUT_MS", 8000) or 8000)
+        except Exception:
+            args.stream_read_timeout_ms = 8000
+
     def _build_session_args(
         self,
         *,
@@ -797,12 +904,13 @@ class PlaybackTracingService:
         member_name: str,
     ) -> argparse.Namespace:
         args = self._base_args()
+        self._apply_playback_stability_overrides(args)
         args.src = [str(rtsp_source)]
         args.camera_ids = [int(camera_id)]
         args.use_db = True
         if not getattr(args, "db_url", ""):
             args.db_url = os.environ.get("DATABASE_URL", "") or ""
-        args.use_face = True
+        args.use_face = bool(getattr(args, "use_face", True))
         args.save_csv = False
         args.csv = ""
         args.no_save_video = True
@@ -947,6 +1055,21 @@ class PlaybackTracingService:
             member_name=member_name_clean,
         ):
             self.stop_session(old_session_id)
+
+        # Keep playback tracing bounded.  A second playback request should replace
+        # the existing one instead of starting another model stack and competing
+        # with the live pipeline for CPU/GPU resources.
+        try:
+            max_sessions = int(getattr(settings, "PLAYBACK_MAX_ACTIVE_SESSIONS", 1) or os.environ.get("PLAYBACK_MAX_ACTIVE_SESSIONS", 1) or 1)
+        except Exception:
+            max_sessions = 1
+        if max_sessions > 0:
+            with self._lock:
+                active_session_ids = list(self._sessions.keys())
+            overflow = len(active_session_ids) - max_sessions + 1
+            if overflow > 0:
+                for old_session_id in active_session_ids[:overflow]:
+                    self.stop_session(old_session_id)
 
         args = self._build_session_args(
             rtsp_source=str(rtsp_source),

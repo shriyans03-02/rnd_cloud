@@ -81,6 +81,12 @@ class Settings(BaseSettings):
     TRACKING_WEBRTC_DRAW_STATS: bool = True
     TRACKING_WEBRTC_LOG_DIR: str = "logs/ffmpeg_webrtc"
     TRACKING_WEBRTC_BOOTSTRAP_PLACEHOLDER: bool = True
+    # Do not start one FFmpeg encoder per camera at backend startup.  Publishers
+    # are started on demand when /v1/tracking/webrtc/{camera_id} is requested.
+    # This is important for 12+ cameras on A100 because A100 has no NVENC;
+    # libx264 encoding is CPU-bound.
+    TRACKING_WEBRTC_AUTOSTART: bool = False
+    TRACKING_WEBRTC_MAX_ACTIVE_PUBLISHERS: int = 0  # 0 = unlimited; set 4/6 if CPU is tight
 
     # Camera channel map, e.g. "11:101,12:301,10:201,9:401"
     CHANNEL_MAP: str = ""

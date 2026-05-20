@@ -7264,6 +7264,7 @@ from pathlib import Path
 from collections import defaultdict, deque
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit, quote, unquote
+import ipaddress
 import os
 # Cloud beast mode: never force CUDA_LAUNCH_BLOCKING by default.  That debug
 # flag serializes all CUDA kernels and can cut live throughput by 3-10x.
@@ -7284,7 +7285,10 @@ except Exception:
 import numpy as np
 import torch
 import json
-import redis as sync_redis
+try:
+    import redis as sync_redis
+except Exception:
+    sync_redis = None
 from app.core.config import settings
 
 try:
@@ -8540,6 +8544,142 @@ def build_galleries_from_db(db_url: str, active_only: bool = True, max_bank_per_
     return people_by_cam, face_gallery, name_to_member_id
 
 
+def _ip_sort_key(ip_value: Any) -> Tuple[int, int, int, int, str]:
+    s = str(ip_value or "").strip()
+    try:
+        ip = ipaddress.ip_address(s)
+        if ip.version == 4:
+            return tuple(int(x) for x in s.split(".")) + (s,)
+    except Exception:
+        pass
+    nums = []
+    for part in s.split("."):
+        try:
+            nums.append(int(part))
+        except Exception:
+            nums.append(999)
+    while len(nums) < 4:
+        nums.append(999)
+    return (nums[0], nums[1], nums[2], nums[3], s)
+
+
+def _env_first(*names: str, default: str = "") -> str:
+    for name in names:
+        val = os.environ.get(str(name), "")
+        if str(val or "").strip():
+            return str(val).strip()
+    return str(default or "")
+
+
+def _build_direct_rtsp_url_from_ip(ip: str) -> str:
+    template = _env_first(
+        "RTSP_URL_TEMPLATE",
+        default="rtsp://{username}:{password}@{ip}:{port}/video/live?channel={channel}&subtype={subtype}",
+    )
+    vals = {
+        "ip": str(ip),
+        "username": _env_first("RTSP_USER", default="admin"),
+        "password": _env_first("RTSP_PASS", default=""),
+        "port": _env_first("RTSP_PORT", default="554"),
+        "path": _env_first("RTSP_PATH", default="/video/live"),
+        "channel": _env_first("RTSP_CHANNEL", default="1"),
+        "subtype": _env_first("RTSP_SUBTYPE", default="0"),
+        "stream": _env_first("RTSP_STREAM", default=""),
+    }
+    try:
+        return template.format(**vals)
+    except Exception:
+        return f"rtsp://{vals['username']}:{vals['password']}@{ip}:{vals['port']}{vals['path']}?channel={vals['channel']}&subtype={vals['subtype']}"
+
+
+def resolve_auto_db_camera_sources(args: argparse.Namespace) -> argparse.Namespace:
+    """Fill args.src/args.camera_ids from the cameras table when --src is omitted.
+
+    In mediamtx mode the camera source is rtsp://127.0.0.1:8554/live/camN,
+    where N is the order/rank of active cameras.  If --camera-ids is supplied,
+    that order is preserved.  This lets the .env contain only camera IDs and
+    pipeline settings; camera IPs live in the DB.
+    """
+    if getattr(args, "src", None):
+        return args
+    if not bool(getattr(args, "auto_db_cameras", True)):
+        return args
+    db_url = str(getattr(args, "db_url", "") or os.environ.get("DATABASE_URL", "") or "").strip()
+    if not db_url:
+        raise RuntimeError("--src was omitted and auto DB cameras are enabled, but DATABASE_URL/--db-url is empty")
+
+    BaseLocal = declarative_base()
+
+    class CameraRow(BaseLocal):
+        __tablename__ = "cameras"
+        id = Column(Integer, primary_key=True)
+        name = Column(String)
+        ip_address = Column(String)
+        is_active = Column(Boolean)
+
+    engine = create_engine(db_url, pool_pre_ping=True)
+    Session = sessionmaker(bind=engine)
+    selected_ids = [int(x) for x in (getattr(args, "camera_ids", []) or []) if int(x) > 0]
+    rows = []
+    with Session() as session:
+        stmt = select(CameraRow.id, CameraRow.name, CameraRow.ip_address, CameraRow.is_active)
+        db_rows = session.execute(stmt).all()
+        for r in db_rows:
+            try:
+                cam_id = int(r[0])
+            except Exception:
+                continue
+            active = bool(r[3]) if r[3] is not None else True
+            if not active:
+                continue
+            if selected_ids and cam_id not in set(selected_ids):
+                continue
+            rows.append({"id": cam_id, "name": str(r[1] or f"Camera {cam_id}"), "ip": str(r[2] or "").strip()})
+    try:
+        engine.dispose()
+    except Exception:
+        pass
+    if not rows:
+        raise RuntimeError("No active DB cameras found for auto camera loading")
+
+    order = str(getattr(args, "db_camera_order", "selected") or "selected").lower()
+    if selected_ids and order == "selected":
+        rank = {int(v): i for i, v in enumerate(selected_ids)}
+        rows.sort(key=lambda x: rank.get(int(x["id"]), 10**9))
+    elif order == "id":
+        rows.sort(key=lambda x: int(x["id"]))
+    else:
+        rows.sort(key=lambda x: (_ip_sort_key(x.get("ip")), int(x["id"])))
+
+    limit = int(getattr(args, "auto_db_camera_limit", 0) or 0)
+    if limit > 0:
+        rows = rows[:limit]
+
+    mode = str(getattr(args, "db_camera_source_mode", "mediamtx") or "mediamtx").strip().lower()
+    sources: List[str] = []
+    cam_ids: List[int] = []
+    mapping_lines: List[str] = []
+    prefix = str(getattr(args, "mediamtx_live_prefix", "") or "").strip()
+    if not prefix:
+        prefix = "rtsp://127.0.0.1:8554/live/cam"
+    for idx, row in enumerate(rows, start=1):
+        cam_id = int(row["id"])
+        ip = str(row.get("ip") or "")
+        if mode == "direct":
+            src = _build_direct_rtsp_url_from_ip(ip)
+        else:
+            src = f"{prefix}{idx}"
+        sources.append(src)
+        cam_ids.append(cam_id)
+        mapping_lines.append(f"cam_id={cam_id} ip={ip or '-'} src={src}")
+    args.src = sources
+    args.camera_ids = cam_ids
+    print(f"[AUTO-DB-CAMERAS] loaded {len(cam_ids)} active cameras mode={mode}")
+    for line in mapping_lines:
+        print(f"[AUTO-DB-CAMERAS] {line}")
+    return args
+
+
 class GalleryManager:
     def __init__(self, args):
         self._lock = threading.Lock()
@@ -9376,6 +9516,74 @@ def resolve_boxmot_device(args: argparse.Namespace, gpu: bool) -> tuple[torch.de
     return torch.device(getattr(args, 'device', 'cuda:0')), bool(getattr(args, 'half', False)), 'cuda(auto)'
 
 
+_HYBRID_REID_SEMAPHORES: Dict[int, threading.BoundedSemaphore] = {}
+_HYBRID_REID_SEMAPHORES_LOCK = threading.Lock()
+
+
+def _hybrid_reid_semaphore(args: argparse.Namespace) -> threading.BoundedSemaphore:
+    limit = int(max(1, int(getattr(args, 'reid_recovery_concurrency', 1) or 1)))
+    with _HYBRID_REID_SEMAPHORES_LOCK:
+        sem = _HYBRID_REID_SEMAPHORES.get(limit)
+        if sem is None:
+            sem = threading.BoundedSemaphore(limit)
+            _HYBRID_REID_SEMAPHORES[limit] = sem
+        return sem
+
+
+class LazyStrongSortTracker:
+    """Lazily construct BoxMOT StrongSORT only when recovery is actually needed.
+
+    With 12-16 cameras, constructing one StrongSORT/ReID network per camera at
+    startup can burn seconds and GPU memory before the first useful frame.  This
+    proxy keeps ByteTrack hot immediately and loads StrongSORT only on the first
+    lost/occlusion/periodic recovery event for that camera.
+    """
+
+    def __init__(self, factory, *, sid: int, camera_id: int):
+        self._factory = factory
+        self._tracker = None
+        self.sid = int(sid)
+        self.camera_id = int(camera_id)
+        self.initialized = False
+        self.init_ms = 0.0
+        self.init_error = ""
+        self._lock = threading.Lock()
+
+    def _get(self):
+        if self._tracker is not None:
+            return self._tracker
+        with self._lock:
+            if self._tracker is not None:
+                return self._tracker
+            t0 = time.perf_counter()
+            try:
+                self._tracker = self._factory()
+                self.initialized = True
+                self.init_ms = (time.perf_counter() - t0) * 1000.0
+                print(f"[HYBRID-REID][src={self.sid} cam={self.camera_id}] StrongSORT lazy init complete in {self.init_ms:.1f}ms")
+            except Exception as exc:
+                self.init_error = str(exc)
+                print(f"[HYBRID-REID][src={self.sid} cam={self.camera_id}] StrongSORT lazy init failed: {exc}")
+                raise
+            return self._tracker
+
+    def update(self, *args, **kwargs):
+        return self._get().update(*args, **kwargs)
+
+
+def make_strongsort_factory(args: argparse.Namespace, strongsort_weights: Optional[Path], gpu: bool, *, sid: int, camera_id: int):
+    def _factory():
+        dev, ss_half, dev_label = resolve_boxmot_device(args, gpu)
+        print(f"[INIT] Hybrid ReID recovery device for SRC {sid}: {dev_label} half={bool(ss_half)}")
+        return BoxStrongSort(
+            reid_weights=strongsort_weights, device=dev, half=bool(ss_half),
+            det_thresh=float(args.conf), max_age=int(args.max_age), max_obs=max(50, int(args.max_age) + 5),
+            min_hits=int(args.n_init), iou_threshold=float(getattr(args, 'max_iou_distance', 0.30)),
+            min_conf=float(args.conf), max_cos_dist=float(args.tracker_max_cosine), n_init=int(args.n_init), nn_budget=int(args.nn_budget),
+        )
+    return _factory
+
+
 class IOUTrack:
     def __init__(self, tlwh, tid):
         self.tlwh = np.array(tlwh, dtype=np.float32)
@@ -9550,6 +9758,12 @@ class HybridByteTrackReIDTracker:
         self.occlusion_iou = float(max(0.0, float(getattr(args, "reid_recovery_occlusion_iou", 0.25) or 0.25)))
         self.log_enabled = bool(getattr(args, "reid_recovery_log", True) or getattr(args, "debug_log", False))
         self.log_interval_s = float(max(0.2, float(getattr(args, "perf_log_interval", 2.0) or 2.0)))
+        self.reid_on_new = bool(getattr(args, "reid_recovery_on_new", False))
+        self.reid_on_lost = bool(getattr(args, "reid_recovery_on_lost", True))
+        self.reid_on_occlusion = bool(getattr(args, "reid_recovery_on_occlusion", True))
+        self.reid_warmup_frames = int(max(0, int(getattr(args, "reid_recovery_warmup_frames", 40) or 0)))
+        self.reid_max_dets = int(max(0, int(getattr(args, "reid_recovery_max_dets", 6) or 0)))
+        self._reid_sem = _hybrid_reid_semaphore(args)
         self.frame_idx = 0
         self.next_stable_id = 1
         self.byte_to_stable: Dict[int, int] = {}
@@ -9648,20 +9862,26 @@ class HybridByteTrackReIDTracker:
         if det_count <= 0:
             return False, "empty"
         reasons: List[str] = []
-        if new_raw_ids:
+        # New ByteTrack IDs are normal in busy live video.  Running ReID for
+        # every new raw ID is what killed 12-camera startup.  Keep it optional.
+        if self.reid_on_new and new_raw_ids and int(self.frame_idx) > int(self.reid_warmup_frames):
             reasons.append(f"new:{len(new_raw_ids)}")
-        if self.lost:
+        if self.reid_on_lost and self.lost:
             reasons.append(f"lost:{len(self.lost)}")
-        if _dets_have_occlusion_xyxy(dets_boxmot, self.occlusion_iou):
+        if self.reid_on_occlusion and _dets_have_occlusion_xyxy(dets_boxmot, self.occlusion_iou):
             reasons.append("occlusion")
         if self.reid_every_n > 0 and (int(self.frame_idx) % int(self.reid_every_n)) == 0:
             reasons.append("periodic")
         if not reasons:
             return False, "steady"
+        # Do not spend 50-2000ms on ReID in crowded frames unless recovering a
+        # lost track.  ByteTrack + face recognition handles normal crowded frames.
+        if self.reid_max_dets > 0 and det_count > self.reid_max_dets and not any(r.startswith("lost") for r in reasons):
+            return False, f"crowded:{det_count}>{self.reid_max_dets}"
         if (int(self.frame_idx) - int(self.last_reid_frame)) < int(self.reid_min_gap):
-            urgent = bool(new_raw_ids and self.lost)
-            if not urgent:
-                return False, "gap"
+            # Lost-track recovery is important, but still respect the gap enough
+            # to avoid running ReID every few frames under packet loss.
+            return False, "gap"
         return True, "+".join(reasons)
 
     def update(self, dets_boxmot: np.ndarray, frame_bgr: np.ndarray):
@@ -9686,21 +9906,35 @@ class HybridByteTrackReIDTracker:
         run_reid, reason = self._should_run_reid(dets_boxmot, byte_tracks, new_raw_ids)
         strong_tracks: List[Any] = []
         if run_reid and self.strong_tracker is not None:
-            reid_t0 = time.perf_counter()
+            acquired = False
             try:
-                ss_res = self.strong_tracker.update(dets_boxmot, frame_bgr)
-            except TypeError:
-                ss_res = self.strong_tracker.update(dets_boxmot)
-            except Exception as exc:
-                self.errors += 1
-                self.last_reid_reason = f"reid_error:{exc}"
-                ss_res = None
-            self.last_reid_ms = (time.perf_counter() - reid_t0) * 1000.0
-            strong_tracks = boxmot_results_to_tracks(ss_res)
-            self.reid_runs += 1
-            self.last_reid_frame = int(self.frame_idx)
-            self.last_reid_used = True
-            self.last_reid_reason = str(reason)
+                acquired = self._reid_sem.acquire(blocking=False)
+            except Exception:
+                acquired = True
+            if not acquired:
+                self.last_reid_reason = "busy"
+            else:
+                reid_t0 = time.perf_counter()
+                try:
+                    try:
+                        ss_res = self.strong_tracker.update(dets_boxmot, frame_bgr)
+                    except TypeError:
+                        ss_res = self.strong_tracker.update(dets_boxmot)
+                    except Exception as exc:
+                        self.errors += 1
+                        self.last_reid_reason = f"reid_error:{exc}"
+                        ss_res = None
+                    self.last_reid_ms = (time.perf_counter() - reid_t0) * 1000.0
+                    strong_tracks = boxmot_results_to_tracks(ss_res)
+                    self.reid_runs += 1
+                    self.last_reid_frame = int(self.frame_idx)
+                    self.last_reid_used = True
+                    self.last_reid_reason = str(reason)
+                finally:
+                    try:
+                        self._reid_sem.release()
+                    except Exception:
+                        pass
         else:
             self.last_reid_reason = str(reason)
 
@@ -12406,8 +12640,13 @@ def parse_args(argv: Optional[List[str]] = None):
         "YOLO -> tracker with member_embeddings DB gallery + rolling embedding updates.",
         conflict_handler="resolve",
     )
-    ap.add_argument("--src", nargs="+", required=True, help="Video sources (RTSP/RTMP/HTTP/file).")
-    ap.add_argument("--camera-ids", nargs="+", type=int, default=[], help="DB camera_ids aligned with --src order. If omitted, defaults to 1..N.")
+    ap.add_argument("--src", nargs="+", default=[], help="Video sources (RTSP/RTMP/HTTP/file). If omitted, active cameras are loaded from DB.")
+    ap.add_argument("--camera-ids", nargs="+", type=int, default=[], help="DB camera_ids aligned with --src order. If --src is omitted, these IDs select/order DB cameras.")
+    ap.add_argument("--auto-db-cameras", action=argparse.BooleanOptionalAction, default=True, help="When --src is omitted, load active cameras from the cameras table and build sources automatically.")
+    ap.add_argument("--auto-db-camera-limit", type=int, default=0, help="Max active DB cameras to run when --src is omitted. 0=all selected/active cameras.")
+    ap.add_argument("--db-camera-source-mode", choices=["mediamtx", "direct"], default="mediamtx", help="Auto DB camera source mode: mediamtx uses rtsp://127.0.0.1:8554/live/camN; direct builds camera RTSP URLs from each DB IP.")
+    ap.add_argument("--mediamtx-live-prefix", default="rtsp://127.0.0.1:8554/live/cam", help="Prefix used in auto DB mediamtx mode. Camera rank N becomes <prefix>N.")
+    ap.add_argument("--db-camera-order", choices=["selected", "ip", "id"], default="selected", help="Ordering for auto DB cameras. selected preserves --camera-ids order; otherwise sort by IP or ID.")
 
     ap.add_argument("--use-db", action="store_true", help="Enable DB gallery.")
     ap.add_argument("--db-url", default="", help="SQLAlchemy DB URL (postgresql://...).")
@@ -12435,9 +12674,9 @@ def parse_args(argv: Optional[List[str]] = None):
     ap.add_argument("--iou", type=float, default=0.45)
     ap.add_argument("--half", action="store_true", help="Enable FP16 where supported")
     ap.add_argument("--yolo-batch", action=argparse.BooleanOptionalAction, default=False, help="Batch YOLO requests across camera threads for higher GPU utilization.")
-    ap.add_argument("--yolo-batch-size", type=int, default=4, help="Max frames per YOLO batch when --yolo-batch is enabled.")
+    ap.add_argument("--yolo-batch-size", type=int, default=8, help="Max frames per YOLO batch when --yolo-batch is enabled. For 8-16 cameras on A100, 8 is usually smoother than 4.")
     ap.add_argument("--yolo-batch-wait-ms", type=float, default=6.0, help="Max wait to form a YOLO batch. 3-8ms is usually best for live streams.")
-    ap.add_argument("--yolo-batch-timeout-s", type=float, default=3.0, help="Safety timeout for a queued YOLO batch job.")
+    ap.add_argument("--yolo-batch-timeout-s", type=float, default=15.0, help="Safety timeout for a queued YOLO batch job. Higher value prevents cold-start timeouts with 12+ cameras.")
     ap.add_argument("--yolo-cuda-stream", action=argparse.BooleanOptionalAction, default=False, help="Run the batched YOLO worker inside its own PyTorch CUDA stream. Experimental; off by default for maximum library compatibility.")
     ap.add_argument("--serialize-yolo", action=argparse.BooleanOptionalAction, default=False, help="Force a global YOLO lock. Safer but slower; normally off in cloud mode.")
     ap.add_argument("--cuda-safe-mode", action=argparse.BooleanOptionalAction, default=False, help="Debug/stability mode: serialize/synchronize CUDA sections. Slower; use only if CUDA faults return.")
@@ -12482,6 +12721,13 @@ def parse_args(argv: Optional[List[str]] = None):
     ap.add_argument("--reid-recovery-match-iou", type=float, default=0.30, help="Hybrid mode: IoU threshold to match ByteTrack boxes with StrongSORT boxes on recovery frames.")
     ap.add_argument("--reid-recovery-occlusion-iou", type=float, default=0.25, help="Hybrid mode: run ReID recovery when person detections overlap by this IoU.")
     ap.add_argument("--reid-recovery-log", action=argparse.BooleanOptionalAction, default=True, help="Log hybrid ByteTrack/ReID recovery decisions to terminal.")
+    ap.add_argument("--reid-recovery-on-new", action=argparse.BooleanOptionalAction, default=False, help="Hybrid mode: run StrongSORT/ReID just because ByteTrack created a new raw ID. Default false for high-FPS multi-camera production; face/geometry handle normal new tracks.")
+    ap.add_argument("--reid-recovery-on-lost", action=argparse.BooleanOptionalAction, default=True, help="Hybrid mode: allow ReID when a previous stable track is recently lost.")
+    ap.add_argument("--reid-recovery-on-occlusion", action=argparse.BooleanOptionalAction, default=True, help="Hybrid mode: allow ReID during detection overlap/occlusion.")
+    ap.add_argument("--reid-recovery-warmup-frames", type=int, default=40, help="Hybrid mode: do not run ReID for new raw IDs during startup/warmup. Prevents 12-camera startup stalls.")
+    ap.add_argument("--reid-recovery-max-dets", type=int, default=6, help="Hybrid mode: skip ReID on very crowded frames above this person count unless there is a lost-track recovery. 0=unlimited.")
+    ap.add_argument("--reid-recovery-concurrency", type=int, default=1, help="Hybrid mode: max concurrent StrongSORT/ReID updates across cameras. 1 avoids GPU/CPU thrash with many cameras.")
+    ap.add_argument("--reid-recovery-lazy-init", action=argparse.BooleanOptionalAction, default=True, help="Hybrid mode: lazily initialize StrongSORT/ReID only on the first actual recovery run instead of loading one ReID model per camera at startup.")
     ap.add_argument("--perf-log-interval", type=float, default=2.0, help="Seconds between terminal performance summaries.")
     ap.add_argument("--debug-log", action=argparse.BooleanOptionalAction, default=False, help="Verbose terminal logging for pipeline internals.")
     ap.add_argument("--log-yolo-inference", action=argparse.BooleanOptionalAction, default=True, help="Log YOLO batch inference timing summaries to terminal.")
@@ -13910,14 +14156,12 @@ def main():
                     match_thresh=float(getattr(args, 'bytetrack_match_thresh', 0.80)), track_buffer=int(getattr(args, 'bytetrack_track_buffer', 25)),
                     frame_rate=int(getattr(args, 'bytetrack_frame_rate', 30)),
                 )
-                dev, ss_half, dev_label = resolve_boxmot_device(args, gpu)
-                print(f"[INIT] Hybrid ReID recovery device for SRC {i}: {dev_label} half={bool(ss_half)}")
-                strong_tracker = BoxStrongSort(
-                    reid_weights=strongsort_weights, device=dev, half=bool(ss_half),
-                    det_thresh=float(args.conf), max_age=int(args.max_age), max_obs=max(50, int(args.max_age) + 5),
-                    min_hits=int(args.n_init), iou_threshold=float(getattr(args, 'max_iou_distance', 0.30)),
-                    min_conf=float(args.conf), max_cos_dist=float(args.tracker_max_cosine), n_init=int(args.n_init), nn_budget=int(args.nn_budget),
-                )
+                strong_factory = make_strongsort_factory(args, strongsort_weights, gpu, sid=int(i), camera_id=int(camera_db_id))
+                if bool(getattr(args, 'reid_recovery_lazy_init', True)):
+                    strong_tracker = LazyStrongSortTracker(strong_factory, sid=int(i), camera_id=int(camera_db_id))
+                    print(f"[INIT] Hybrid ReID recovery for SRC {i}: lazy StrongSORT enabled")
+                else:
+                    strong_tracker = strong_factory()
                 deep_tracker = HybridByteTrackReIDTracker(byte_tracker, strong_tracker, args, sid=int(i), camera_id=int(camera_db_id))
             except Exception as e:
                 print(f"[WARN] Hybrid tracker init failed for SRC {i}, fallback to ByteTrack/IoU tracker: {e}")
@@ -14431,6 +14675,9 @@ class TrackingRunner:
             raise RuntimeError("TrackingRunner requires --use-db and --db-url.")
         if not str(getattr(args, "db_url", "") or "").strip():
             raise RuntimeError("TrackingRunner requires --db-url.")
+        resolve_auto_db_camera_sources(args)
+        if not getattr(args, "src", None):
+            raise RuntimeError("No camera sources configured. Provide --src or enable --auto-db-cameras with active DB cameras.")
         if not getattr(args, "camera_ids", None):
             args.camera_ids = []
         if len(args.camera_ids) == 0:
@@ -14644,14 +14891,12 @@ class TrackingRunner:
                         match_thresh=float(getattr(args, 'bytetrack_match_thresh', 0.80)), track_buffer=int(getattr(args, 'bytetrack_track_buffer', 25)),
                         frame_rate=int(getattr(args, 'bytetrack_frame_rate', 30)),
                     )
-                    dev, ss_half, dev_label = resolve_boxmot_device(args, gpu)
-                    print(f"[INIT] (service) Hybrid ReID recovery device for SRC {sid}: {dev_label} half={bool(ss_half)}")
-                    strong_tracker = BoxStrongSort(
-                        reid_weights=strongsort_weights, device=dev, half=bool(ss_half),
-                        det_thresh=float(args.conf), max_age=int(args.max_age), max_obs=max(50, int(args.max_age) + 5),
-                        min_hits=int(args.n_init), iou_threshold=float(getattr(args, 'max_iou_distance', 0.30)),
-                        min_conf=float(args.conf), max_cos_dist=float(args.tracker_max_cosine), n_init=int(args.n_init), nn_budget=int(args.nn_budget),
-                    )
+                    strong_factory = make_strongsort_factory(args, strongsort_weights, gpu, sid=int(sid), camera_id=int(camera_db_id))
+                    if bool(getattr(args, 'reid_recovery_lazy_init', True)):
+                        strong_tracker = LazyStrongSortTracker(strong_factory, sid=int(sid), camera_id=int(camera_db_id))
+                        print(f"[INIT] (service) Hybrid ReID recovery for SRC {sid}: lazy StrongSORT enabled")
+                    else:
+                        strong_tracker = strong_factory()
                     deep_tracker = HybridByteTrackReIDTracker(byte_tracker, strong_tracker, args, sid=int(sid), camera_id=int(camera_db_id))
                 except Exception as e:
                     print(f"[WARN] (service) Hybrid tracker init failed for SRC {sid}, fallback to ByteTrack/IoU tracker: {e}")
@@ -14890,6 +15135,9 @@ class TrackingRunner:
             "hybrid_stats": hybrid_stats,
             "reid_recovery_every_n": int(getattr(self.args, "reid_recovery_every_n", 0) or 0),
             "reid_recovery_min_gap_frames": int(getattr(self.args, "reid_recovery_min_gap_frames", 0) or 0),
+            "reid_recovery_on_new": bool(getattr(self.args, "reid_recovery_on_new", False)),
+            "reid_recovery_max_dets": int(getattr(self.args, "reid_recovery_max_dets", 0) or 0),
+            "auto_db_cameras": bool(getattr(self.args, "auto_db_cameras", True)),
             "yolo_cuda_stream": bool(getattr(self.args, "yolo_cuda_stream", False)),
             "save_video": bool(getattr(self.args, "save_video", True)),
             "video_dir": str(getattr(self._seg_writer, "run_dir", "") or ""),

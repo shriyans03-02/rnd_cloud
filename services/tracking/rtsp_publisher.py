@@ -202,7 +202,7 @@ class ProcessedFrameRtspPublisher:
                 "-c:v", "libx264",
                 "-preset", preset,
                 "-tune", "zerolatency",
-                "-threads", "2",
+                "-threads", "1",
                 "-profile:v", "baseline",
                 "-level:v", "3.1",
                 "-pix_fmt", "yuv420p",

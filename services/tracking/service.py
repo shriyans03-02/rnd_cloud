@@ -76,7 +76,14 @@ class DetectionService:
         self._runner = LiveTrackingRunner(args)
         try:
             self._runner.start()
-            self._start_processed_publishers(args)
+            if bool(getattr(settings, "TRACKING_WEBRTC_AUTOSTART", False)):
+                self._start_processed_publishers(args)
+            else:
+                try:
+                    cam_count = len(self._runner.status().get("camera_ids") or [])
+                except Exception:
+                    cam_count = 0
+                print(f"[INIT] Processed WebRTC publishers: lazy/on-demand (active cameras={cam_count}). First /v1/tracking/webrtc/<camera_id> request starts that camera publisher.")
         except Exception:
             try:
                 self.stop_processed_publishers()
@@ -111,6 +118,89 @@ class DetectionService:
             "whep_url": f"{base}/{path}/whep",
             "player_url": f"{base}/{path}",
         }
+
+    def _make_processed_publisher(self, cam_id: int) -> Optional[ProcessedFrameRtspPublisher]:
+        if not bool(getattr(settings, "TRACKING_WEBRTC_ENABLED", True)):
+            return None
+        if self._runner is None:
+            return None
+        mediamtx_rtsp = str(getattr(settings, "MEDIAMTX_RTSP", "") or "").strip()
+        if not mediamtx_rtsp:
+            print("[WARN] TRACKING_WEBRTC_ENABLED is true but MEDIAMTX_RTSP is empty; processed WebRTC publisher not started")
+            return None
+        try:
+            buf = self._runner.get_camera_buffer(int(cam_id))
+        except Exception:
+            buf = None
+        try:
+            raw_buf = self._runner.get_camera_raw_buffer(int(cam_id))
+        except Exception:
+            raw_buf = None
+        if buf is None:
+            print(f"[WARN] No processed frame buffer for camera_id={cam_id}; WebRTC publisher skipped")
+            return None
+        stream_name = self._live_stream_name(int(cam_id))
+        return ProcessedFrameRtspPublisher(
+            buffer=buf,
+            raw_buffer=raw_buf,
+            stream_name=stream_name,
+            ffmpeg_bin=str(getattr(settings, "FFMPEG_BIN", "ffmpeg") or "ffmpeg"),
+            mediamtx_rtsp_base=mediamtx_rtsp,
+            mode=str(getattr(settings, "TRACKING_WEBRTC_MODE", "hybrid") or "hybrid"),
+            fps=float(getattr(settings, "TRACKING_WEBRTC_FPS", 15.0) or 15.0),
+            width=int(getattr(settings, "TRACKING_WEBRTC_WIDTH", 852) or 0),
+            height=int(getattr(settings, "TRACKING_WEBRTC_HEIGHT", 480) or 0),
+            codec=str(getattr(settings, "TRACKING_WEBRTC_CODEC", "auto") or "auto"),
+            bitrate=str(getattr(settings, "TRACKING_WEBRTC_BITRATE", "1800k") or "1800k"),
+            bufsize=str(getattr(settings, "TRACKING_WEBRTC_BUFSIZE", "360k") or "360k"),
+            x264_preset=str(getattr(settings, "TRACKING_WEBRTC_X264_PRESET", "ultrafast") or "ultrafast"),
+            overlay_max_age_ms=int(getattr(settings, "TRACKING_WEBRTC_OVERLAY_MAX_AGE_MS", 1500) or 1500),
+            gop=int(getattr(settings, "TRACKING_WEBRTC_GOP", 20) or 20),
+            draw_stats=bool(getattr(settings, "TRACKING_WEBRTC_DRAW_STATS", True)),
+            log_dir=str(getattr(settings, "TRACKING_WEBRTC_LOG_DIR", "logs/ffmpeg_webrtc") or "logs/ffmpeg_webrtc"),
+        )
+
+    def ensure_processed_publisher(self, cam_id: int) -> None:
+        cam_id = int(cam_id)
+        if self._runner is None:
+            self.start()
+        with self._publishers_lock:
+            existing = self._publishers.get(cam_id)
+            if existing is not None:
+                st = existing.status()
+                if bool(st.get("alive")):
+                    return
+                try:
+                    existing.stop()
+                except Exception:
+                    pass
+                self._publishers.pop(cam_id, None)
+            max_active = int(getattr(settings, "TRACKING_WEBRTC_MAX_ACTIVE_PUBLISHERS", 0) or 0)
+            if max_active > 0 and len(self._publishers) >= max_active:
+                # Stop the oldest inserted publisher.  Dict preserves insertion order.
+                old_cam_id, old_pub = next(iter(self._publishers.items()))
+                self._publishers.pop(old_cam_id, None)
+                try:
+                    old_pub.stop()
+                except Exception:
+                    pass
+                print(f"[WEBRTC] max active publishers={max_active}; stopped camera_id={old_cam_id} before starting camera_id={cam_id}")
+        publisher = self._make_processed_publisher(cam_id)
+        if publisher is None:
+            return
+        try:
+            publisher.start()
+            with self._publishers_lock:
+                old = self._publishers.get(cam_id)
+                self._publishers[cam_id] = publisher
+            if old is not None:
+                try:
+                    old.stop()
+                except Exception:
+                    pass
+            print(f"[WEBRTC] on-demand publisher started camera_id={cam_id} mode={publisher.mode} -> {publisher.rtsp_output}")
+        except Exception as exc:
+            print(f"[WARN] Could not start on-demand WebRTC publisher camera_id={cam_id}: {exc}")
 
     def _start_processed_publishers(self, args: argparse.Namespace) -> None:
         if not bool(getattr(settings, "TRACKING_WEBRTC_ENABLED", True)):
@@ -293,6 +383,12 @@ class DetectionService:
         return out
 
     def get_webrtc_stream(self, cam_id: int, public_base: Optional[str] = None) -> Dict[str, Any]:
+        # Start the FFmpeg/MediaMTX publisher lazily for exactly the camera the UI opened.
+        # This avoids running 12+ CPU encoders at backend startup.
+        try:
+            self.ensure_processed_publisher(int(cam_id))
+        except Exception as exc:
+            print(f"[WEBRTC] ensure publisher failed camera_id={int(cam_id)}: {exc}")
         streams = self.get_webrtc_streams(cam_ids=[int(cam_id)], public_base=public_base)
         return streams[0] if streams else {}
 

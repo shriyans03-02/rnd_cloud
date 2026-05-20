@@ -158,6 +158,16 @@ class Settings(BaseSettings):
     PLAYBACK_STREAM_OPEN_TIMEOUT_MS: int = 8000
     PLAYBACK_STREAM_READ_TIMEOUT_MS: int = 8000
     PLAYBACK_MAX_ACTIVE_SESSIONS: int = 1
+    # Playback publisher smoothing. Keep MediaMTX path alive but do not flash
+    # black placeholder frames between decoded/annotated frames.
+    PLAYBACK_HOLD_LAST_FRAME: bool = True
+    PLAYBACK_PLACEHOLDER_BEFORE_FIRST_FRAME_ONLY: bool = True
+    PLAYBACK_BOOTSTRAP_PLACEHOLDER: bool = True
+    PLAYBACK_WEBRTC_FPS: float = 10.0
+    PLAYBACK_WEBRTC_GOP: int = 20
+    PLAYBACK_WEBRTC_BITRATE: str = "2500k"
+    PLAYBACK_WEBRTC_BUFSIZE: str = "5000k"
+    PLAYBACK_WEBRTC_PRESET: str = "ultrafast"
 
     # Camera channel map, e.g. "11:101,12:301,10:201,9:401"
     CHANNEL_MAP: str = ""

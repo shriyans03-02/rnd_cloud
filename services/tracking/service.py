@@ -445,7 +445,16 @@ class AnnotatedRtspPublisher:
         self._error: str = ""
         self._size: Optional[tuple[int, int]] = None
         self._started_writes: int = 0
+        self._real_frames_written: int = 0
+        self._placeholder_frames_written: int = 0
+        self._held_frames_written: int = 0
         self._last_seq: int = -1
+        self._last_good_frame: Optional[np.ndarray] = None
+        self._hold_last_frame: bool = self._env_bool("PLAYBACK_HOLD_LAST_FRAME", True)
+        self._placeholder_before_first_only: bool = self._env_bool(
+            "PLAYBACK_PLACEHOLDER_BEFORE_FIRST_FRAME_ONLY", True
+        )
+        self._bootstrap_placeholder: bool = self._env_bool("PLAYBACK_BOOTSTRAP_PLACEHOLDER", True)
 
     @staticmethod
     def _even_size(w: int, h: int) -> tuple[int, int]:
@@ -453,9 +462,26 @@ class AnnotatedRtspPublisher:
         hh = max(2, int(h) - (int(h) % 2))
         return ww, hh
 
+    @staticmethod
+    def _env_bool(name: str, default: bool) -> bool:
+        raw = os.environ.get(str(name))
+        if raw is None:
+            return bool(default)
+        return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+
     def _build_cmd(self, w: int, h: int) -> list[str]:
         fps_txt = f"{self.fps:.3f}"
-        keyint = max(1, int(round(self.fps)))
+        try:
+            keyint = int(os.environ.get("PLAYBACK_WEBRTC_GOP", "") or 0)
+        except Exception:
+            keyint = 0
+        if keyint <= 0:
+            keyint = max(1, int(round(self.fps * 2.0)))
+
+        preset = str(os.environ.get("PLAYBACK_WEBRTC_PRESET", "ultrafast") or "ultrafast").strip()
+        bitrate = str(os.environ.get("PLAYBACK_WEBRTC_BITRATE", "2500k") or "2500k").strip()
+        bufsize = str(os.environ.get("PLAYBACK_WEBRTC_BUFSIZE", "5000k") or "5000k").strip()
+
         return [
             self.ffmpeg_bin,
             "-loglevel", "error",
@@ -467,11 +493,14 @@ class AnnotatedRtspPublisher:
             "-i", "-",
             "-an",
             "-c:v", self.codec,
-            "-preset", "ultrafast",
+            "-preset", preset,
             "-tune", "zerolatency",
             "-profile:v", "baseline",
             "-level:v", "3.1",
             "-pix_fmt", "yuv420p",
+            "-b:v", bitrate,
+            "-maxrate", bitrate,
+            "-bufsize", bufsize,
             "-g", str(keyint),
             "-keyint_min", str(keyint),
             "-sc_threshold", "0",
@@ -597,7 +626,13 @@ class AnnotatedRtspPublisher:
             return False
         return True
 
-    def _write_frame_to_proc(self, frame_bgr: np.ndarray) -> bool:
+    def _write_frame_to_proc(
+        self,
+        frame_bgr: np.ndarray,
+        *,
+        source: str = "real",
+        mark_ready: bool = True,
+    ) -> bool:
         if not self._ensure_proc_for_frame(frame_bgr):
             return False
         assert self._proc is not None and self._proc.stdin is not None
@@ -606,8 +641,18 @@ class AnnotatedRtspPublisher:
         except (BrokenPipeError, OSError) as exc:
             self._error = f"ffmpeg pipe failed: {exc}"
             return False
+
         self._started_writes += 1
-        self._ready_evt.set()
+        src = str(source or "real").strip().lower()
+        if src == "placeholder":
+            self._placeholder_frames_written += 1
+        elif src == "held":
+            self._held_frames_written += 1
+        else:
+            self._real_frames_written += 1
+
+        if mark_ready:
+            self._ready_evt.set()
         return True
 
     def _loop(self) -> None:
@@ -616,14 +661,18 @@ class AnnotatedRtspPublisher:
         wait_timeout = min(0.5, max(0.02, 1.0 / max(1.0, float(self.fps))))
         self.buffer.add_client()
         try:
-            # Start the MediaMTX publisher immediately with a placeholder frame.
-            # Without this bootstrap, the browser can open the WebRTC page before
-            # the first NVR frame is decoded and see an unavailable path.
-            try:
-                placeholder = self._prepare_frame(self._make_placeholder_frame())
-                self._write_frame_to_proc(placeholder)
-            except Exception:
-                pass
+            # Start the MediaMTX publisher path immediately, but mark the
+            # session ready only after the first real processed frame. The
+            # placeholder is allowed before the decoder/model produces output;
+            # after that, gaps repeat the last good frame instead of flashing
+            # back to black. This fixes CP Plus playback flicker when CPU
+            # annotation is slower than the WebRTC output cadence.
+            if self._bootstrap_placeholder:
+                try:
+                    placeholder = self._prepare_frame(self._make_placeholder_frame())
+                    self._write_frame_to_proc(placeholder, source="placeholder", mark_ready=False)
+                except Exception:
+                    pass
 
             while not self._stop_evt.is_set():
                 try:
@@ -637,13 +686,23 @@ class AnnotatedRtspPublisher:
 
                 if frame is None or int(seq) <= int(self._last_seq):
                     idle_loops += 1
+
+                    # Do not publish a black waiting frame after real playback
+                    # has already begun. Repeating the previous real frame keeps
+                    # WebRTC's RTP cadence stable and avoids blink/flicker.
                     if self._proc is not None and self._proc.stdin is not None and self._proc.poll() is None:
                         try:
-                            placeholder = self._prepare_frame(self._make_placeholder_frame())
-                            if not self._write_frame_to_proc(placeholder):
-                                break
+                            if self._last_good_frame is not None and self._hold_last_frame:
+                                held = np.ascontiguousarray(self._last_good_frame)
+                                if not self._write_frame_to_proc(held, source="held", mark_ready=True):
+                                    break
+                            elif (not self._placeholder_before_first_only) or self._real_frames_written <= 0:
+                                placeholder = self._prepare_frame(self._make_placeholder_frame())
+                                if not self._write_frame_to_proc(placeholder, source="placeholder", mark_ready=False):
+                                    break
                         except Exception:
                             pass
+
                     if idle_loops >= max_idle_loops:
                         # Do not tear the session down just because annotated
                         # playback has a long decode gap. NVR playback often
@@ -664,7 +723,8 @@ class AnnotatedRtspPublisher:
                     self._error = f"frame prepare failed: {exc}"
                     break
 
-                if not self._write_frame_to_proc(frame_bgr):
+                self._last_good_frame = np.ascontiguousarray(frame_bgr.copy())
+                if not self._write_frame_to_proc(frame_bgr, source="real", mark_ready=True):
                     break
         finally:
             try:
@@ -711,6 +771,10 @@ class AnnotatedRtspPublisher:
             "ready": bool(self._ready_evt.is_set()),
             "alive": bool(self.is_alive()),
             "frames_published": int(self._started_writes),
+            "real_frames_published": int(self._real_frames_written),
+            "held_frames_published": int(self._held_frames_written),
+            "placeholder_frames_published": int(self._placeholder_frames_written),
+            "holding_last_frame": bool(self._last_good_frame is not None and self._hold_last_frame),
             "error": str(self._error or ""),
         }
 
@@ -874,9 +938,18 @@ class PlaybackTracingService:
             args.face_every_n = 5
 
         try:
-            args.video_fps = float(getattr(settings, "PLAYBACK_VIDEO_FPS", 20.0) or os.environ.get("PLAYBACK_VIDEO_FPS", 20.0) or 20.0)
+            # PLAYBACK_VIDEO_FPS controls how fast annotated frames are written
+            # into MediaMTX. If it is not set, honor PLAYBACK_WEBRTC_FPS from
+            # the env so the publisher does not run at the old 20 FPS default.
+            video_fps_raw = (
+                os.environ.get("PLAYBACK_VIDEO_FPS")
+                or os.environ.get("PLAYBACK_WEBRTC_FPS")
+                or getattr(settings, "PLAYBACK_VIDEO_FPS", 10.0)
+                or 10.0
+            )
+            args.video_fps = float(video_fps_raw)
         except Exception:
-            args.video_fps = 20.0
+            args.video_fps = 10.0
         try:
             args.queue_size = max(16, int(getattr(settings, "PLAYBACK_QUEUE_SIZE", 256) or os.environ.get("PLAYBACK_QUEUE_SIZE", 256) or 256))
         except Exception:
@@ -948,10 +1021,13 @@ class PlaybackTracingService:
         except Exception:
             pass
 
-        # Member playback should show only the target person. Location playback
-        # should still show all detected people, even when they are Unknown.
+        # Member playback should show only the target person when face matching
+        # is enabled. If playback is running in CPU/no-face stabilisation mode,
+        # keep Unknown boxes visible instead of returning a clean video with all
+        # boxes hidden. This avoids perceived information loss while still
+        # preventing the CUDA crash path.
         if str(request_mode) == "member":
-            args.hide_unknown = True
+            args.hide_unknown = bool(getattr(args, "use_face", False))
             args.face_confirm_hits = 1
             args.face_switch_confirm_hits = 1
             args.camera_name_switch_hits = 1

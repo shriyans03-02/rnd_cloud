@@ -8595,10 +8595,12 @@ def _build_direct_rtsp_url_from_ip(ip: str) -> str:
 def resolve_auto_db_camera_sources(args: argparse.Namespace) -> argparse.Namespace:
     """Fill args.src/args.camera_ids from the cameras table when --src is omitted.
 
-    In mediamtx mode the camera source is rtsp://127.0.0.1:8554/live/camN,
-    where N is the order/rank of active cameras.  If --camera-ids is supplied,
-    that order is preserved.  This lets the .env contain only camera IDs and
-    pipeline settings; camera IPs live in the DB.
+    Production default is mediamtx-id mode:
+        DB camera id 19 -> rtsp://127.0.0.1:8554/live/cam19
+        DB camera id 20 -> rtsp://127.0.0.1:8554/live/cam20
+
+    This removes every hard-coded camera URL and every hard-coded camera ID from
+    pipeline_args. The cameras table becomes the source of truth.
     """
     if getattr(args, "src", None):
         return args
@@ -8620,6 +8622,7 @@ def resolve_auto_db_camera_sources(args: argparse.Namespace) -> argparse.Namespa
     engine = create_engine(db_url, pool_pre_ping=True)
     Session = sessionmaker(bind=engine)
     selected_ids = [int(x) for x in (getattr(args, "camera_ids", []) or []) if int(x) > 0]
+    selected_set = set(selected_ids)
     rows = []
     with Session() as session:
         stmt = select(CameraRow.id, CameraRow.name, CameraRow.ip_address, CameraRow.is_active)
@@ -8632,7 +8635,7 @@ def resolve_auto_db_camera_sources(args: argparse.Namespace) -> argparse.Namespa
             active = bool(r[3]) if r[3] is not None else True
             if not active:
                 continue
-            if selected_ids and cam_id not in set(selected_ids):
+            if selected_set and cam_id not in selected_set:
                 continue
             rows.append({"id": cam_id, "name": str(r[1] or f"Camera {cam_id}"), "ip": str(r[2] or "").strip()})
     try:
@@ -8642,38 +8645,44 @@ def resolve_auto_db_camera_sources(args: argparse.Namespace) -> argparse.Namespa
     if not rows:
         raise RuntimeError("No active DB cameras found for auto camera loading")
 
-    order = str(getattr(args, "db_camera_order", "selected") or "selected").lower()
+    order = str(getattr(args, "db_camera_order", "id") or "id").lower()
     if selected_ids and order == "selected":
         rank = {int(v): i for i, v in enumerate(selected_ids)}
         rows.sort(key=lambda x: rank.get(int(x["id"]), 10**9))
-    elif order == "id":
-        rows.sort(key=lambda x: int(x["id"]))
-    else:
+    elif order == "ip":
         rows.sort(key=lambda x: (_ip_sort_key(x.get("ip")), int(x["id"])))
+    else:
+        rows.sort(key=lambda x: int(x["id"]))
 
     limit = int(getattr(args, "auto_db_camera_limit", 0) or 0)
     if limit > 0:
         rows = rows[:limit]
 
-    mode = str(getattr(args, "db_camera_source_mode", "mediamtx") or "mediamtx").strip().lower()
+    mode = str(getattr(args, "db_camera_source_mode", "mediamtx-id") or "mediamtx-id").strip().lower()
     sources: List[str] = []
     cam_ids: List[int] = []
     mapping_lines: List[str] = []
     prefix = str(getattr(args, "mediamtx_live_prefix", "") or "").strip()
     if not prefix:
         prefix = "rtsp://127.0.0.1:8554/live/cam"
+    meta: Dict[int, Dict[str, Any]] = {}
     for idx, row in enumerate(rows, start=1):
         cam_id = int(row["id"])
         ip = str(row.get("ip") or "")
+        name = str(row.get("name") or f"Camera {cam_id}")
         if mode == "direct":
             src = _build_direct_rtsp_url_from_ip(ip)
-        else:
+        elif mode == "mediamtx":
             src = f"{prefix}{idx}"
+        else:
+            src = f"{prefix}{cam_id}"
         sources.append(src)
         cam_ids.append(cam_id)
-        mapping_lines.append(f"cam_id={cam_id} ip={ip or '-'} src={src}")
+        meta[int(cam_id)] = {"id": int(cam_id), "camera_id": int(cam_id), "name": name, "ip_address": ip, "src": src, "source_mode": mode}
+        mapping_lines.append(f"cam_id={cam_id} name={name!r} ip={ip or '-'} src={src}")
     args.src = sources
     args.camera_ids = cam_ids
+    args.camera_db_meta = meta
     print(f"[AUTO-DB-CAMERAS] loaded {len(cam_ids)} active cameras mode={mode}")
     for line in mapping_lines:
         print(f"[AUTO-DB-CAMERAS] {line}")
@@ -12644,9 +12653,9 @@ def parse_args(argv: Optional[List[str]] = None):
     ap.add_argument("--camera-ids", nargs="+", type=int, default=[], help="DB camera_ids aligned with --src order. If --src is omitted, these IDs select/order DB cameras.")
     ap.add_argument("--auto-db-cameras", action=argparse.BooleanOptionalAction, default=True, help="When --src is omitted, load active cameras from the cameras table and build sources automatically.")
     ap.add_argument("--auto-db-camera-limit", type=int, default=0, help="Max active DB cameras to run when --src is omitted. 0=all selected/active cameras.")
-    ap.add_argument("--db-camera-source-mode", choices=["mediamtx", "direct"], default="mediamtx", help="Auto DB camera source mode: mediamtx uses rtsp://127.0.0.1:8554/live/camN; direct builds camera RTSP URLs from each DB IP.")
+    ap.add_argument("--db-camera-source-mode", choices=["mediamtx-id", "mediamtx", "direct"], default="mediamtx-id", help="Auto DB camera source mode: mediamtx-id uses rtsp://127.0.0.1:8554/live/cam<ID>; mediamtx uses live/camN; direct builds RTSP URLs from DB IPs.")
     ap.add_argument("--mediamtx-live-prefix", default="rtsp://127.0.0.1:8554/live/cam", help="Prefix used in auto DB mediamtx mode. Camera rank N becomes <prefix>N.")
-    ap.add_argument("--db-camera-order", choices=["selected", "ip", "id"], default="selected", help="Ordering for auto DB cameras. selected preserves --camera-ids order; otherwise sort by IP or ID.")
+    ap.add_argument("--db-camera-order", choices=["selected", "ip", "id"], default="id", help="Ordering for auto DB cameras. selected preserves --camera-ids order; otherwise sort by IP or ID. Default id keeps live/cam<ID> stable.")
 
     ap.add_argument("--use-db", action="store_true", help="Enable DB gallery.")
     ap.add_argument("--db-url", default="", help="SQLAlchemy DB URL (postgresql://...).")
@@ -12731,6 +12740,9 @@ def parse_args(argv: Optional[List[str]] = None):
     ap.add_argument("--perf-log-interval", type=float, default=2.0, help="Seconds between terminal performance summaries.")
     ap.add_argument("--debug-log", action=argparse.BooleanOptionalAction, default=False, help="Verbose terminal logging for pipeline internals.")
     ap.add_argument("--log-yolo-inference", action=argparse.BooleanOptionalAction, default=True, help="Log YOLO batch inference timing summaries to terminal.")
+    ap.add_argument("--scale-profile", choices=["auto", "quality", "balanced", "throughput"], default="auto", help="Auto-tune expensive stages by camera count. auto switches to throughput for 8+ cameras.")
+    ap.add_argument("--force-reid-at-scale", action=argparse.BooleanOptionalAction, default=False, help="Keep StrongSORT/ReID recovery enabled even when many cameras are active. Off by default because ReID is the main 12-camera FPS killer.")
+    ap.add_argument("--auto-scale-camera-threshold", type=int, default=8, help="Camera count at which scale-profile=auto switches to throughput settings.")
     ap.add_argument("--bytetrack-min-conf", type=float, default=0.10, help="ByteTrack: discard detections below this conf.")
     ap.add_argument("--bytetrack-track-thresh", type=float, default=0.45, help="ByteTrack: high-confidence threshold for first association.")
     ap.add_argument("--bytetrack-match-thresh", type=float, default=0.80, help="ByteTrack: matching threshold.")
@@ -14641,6 +14653,63 @@ def _service_video_writer_loop(stop_evt: threading.Event, streams: List[Dict[str
         stop_evt.wait(sleep_s)
 
 
+def _apply_scale_profile(args: argparse.Namespace, camera_count: int) -> None:
+    """Auto-tune the expensive parts when many cameras are active.
+
+    One A100 is powerful, but 12 x 20 FPS with YOLOv8x + face + ReID + CPU
+    decode/encode can still bottleneck on CPU and per-frame ReID.  This profile
+    keeps the stream smooth by moving to ByteTrack+face first and disabling
+    StrongSORT/ReID at scale unless explicitly forced.
+    """
+    n = int(max(1, int(camera_count or 1)))
+    threshold = int(max(1, int(getattr(args, "auto_scale_camera_threshold", 8) or 8)))
+    profile = str(getattr(args, "scale_profile", "auto") or "auto").strip().lower()
+    if profile == "auto":
+        profile = "throughput" if n >= threshold else "balanced"
+    if profile not in {"quality", "balanced", "throughput"}:
+        profile = "balanced"
+
+    changes: List[str] = []
+    def set_if_gt(attr: str, val: int):
+        cur = int(getattr(args, attr, 0) or 0)
+        if cur <= 0 or cur > int(val):
+            setattr(args, attr, int(val)); changes.append(f"{attr}={val}")
+    def set_if_lt(attr: str, val: int):
+        cur = int(getattr(args, attr, 0) or 0)
+        if cur < int(val):
+            setattr(args, attr, int(val)); changes.append(f"{attr}={val}")
+
+    if profile == "throughput":
+        # YOLOv8x at 960 with 12 cameras caused 2s batches in the user's logs.
+        set_if_gt("yolo_imgsz", 640)
+        set_if_lt("yolo_batch_size", min(12, max(8, n)))
+        set_if_lt("yolo_batch_wait_ms", 10)
+        set_if_lt("face_every_n", 20)
+        if bool(getattr(args, "reid_recovery_enabled", True)) and not bool(getattr(args, "force_reid_at_scale", False)):
+            args.reid_recovery_enabled = False
+            changes.append("reid_recovery_enabled=False")
+        # Keep raw history tight; each 1080p frame is ~6 MB.
+        try:
+            if float(getattr(args, "raw_history_seconds", 1.0) or 1.0) > 1.0:
+                args.raw_history_seconds = 1.0; changes.append("raw_history_seconds=1.0")
+        except Exception:
+            pass
+        set_if_gt("raw_history_max_frames", 30)
+    elif profile == "balanced" and n >= threshold:
+        set_if_gt("yolo_imgsz", 736)
+        set_if_lt("face_every_n", 12)
+        set_if_lt("reid_recovery_every_n", 120)
+        set_if_lt("reid_recovery_min_gap_frames", 40)
+    # Never let ReID run for new IDs in multi-camera mode unless the user forces it.
+    if n >= threshold and not bool(getattr(args, "force_reid_at_scale", False)):
+        if bool(getattr(args, "reid_recovery_on_new", False)):
+            args.reid_recovery_on_new = False; changes.append("reid_recovery_on_new=False")
+    if changes:
+        print(f"[SCALE-PROFILE] profile={profile} cameras={n} applied: " + ", ".join(changes))
+    else:
+        print(f"[SCALE-PROFILE] profile={profile} cameras={n} no changes")
+
+
 class TrackingRunner:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -14676,6 +14745,7 @@ class TrackingRunner:
         if not str(getattr(args, "db_url", "") or "").strip():
             raise RuntimeError("TrackingRunner requires --db-url.")
         resolve_auto_db_camera_sources(args)
+        _apply_scale_profile(args, len(getattr(args, "src", []) or []))
         if not getattr(args, "src", None):
             raise RuntimeError("No camera sources configured. Provide --src or enable --auto-db-cameras with active DB cameras.")
         if not getattr(args, "camera_ids", None):
@@ -15079,14 +15149,17 @@ class TrackingRunner:
 
     def list_db_cameras(self, active_only: bool = True) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
+        meta = getattr(self.args, "camera_db_meta", {}) or {}
         for s in self._streams:
             cam_id = int(s.get("camera_db_id", -1))
-            out.append({
+            item = dict(meta.get(int(cam_id), {}) or {})
+            item.update({
                 "id": cam_id,
                 "camera_id": cam_id,
-                "src": str(s.get("src", "")),
+                "src": str(s.get("src", item.get("src", ""))),
                 "running": bool(getattr(s.get("vs", None), "is_opened", lambda: False)()),
             })
+            out.append(item)
         out.sort(key=lambda x: int(x.get("id", 0)))
         return out
 
@@ -15138,6 +15211,10 @@ class TrackingRunner:
             "reid_recovery_on_new": bool(getattr(self.args, "reid_recovery_on_new", False)),
             "reid_recovery_max_dets": int(getattr(self.args, "reid_recovery_max_dets", 0) or 0),
             "auto_db_cameras": bool(getattr(self.args, "auto_db_cameras", True)),
+            "scale_profile": str(getattr(self.args, "scale_profile", "auto") or "auto"),
+            "effective_yolo_imgsz": int(getattr(self.args, "yolo_imgsz", 0) or 0),
+            "effective_face_every_n": int(getattr(self.args, "face_every_n", 0) or 0),
+            "reid_recovery_enabled": bool(getattr(self.args, "reid_recovery_enabled", False)),
             "yolo_cuda_stream": bool(getattr(self.args, "yolo_cuda_stream", False)),
             "save_video": bool(getattr(self.args, "save_video", True)),
             "video_dir": str(getattr(self._seg_writer, "run_dir", "") or ""),

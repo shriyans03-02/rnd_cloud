@@ -57,6 +57,14 @@ class Settings(BaseSettings):
     MEDIAMTX_RTSP: str = "rtsp://localhost:8554"
     MEDIAMTX_INTERNAL: str = "http://localhost:8888"
     HLS_BASE_URL: str = ""
+    # Generate mediamtx.yml from the cameras DB table at backend startup.
+    # live/cam<ID> is created for every active camera; no hard-coded MediaMTX camera list required.
+    MEDIAMTX_AUTOCONFIG: bool = True
+    MEDIAMTX_CONFIG_PATH: str = "/root/mediamtx.yml"
+    MEDIAMTX_PUBLIC_IP: str = "164.52.214.233"
+    MEDIAMTX_SOURCE_ON_DEMAND: bool = True
+    MEDIAMTX_CAMERA_RTSP_TRANSPORT: str = "tcp"
+    MEDIAMTX_WRITE_QUEUE_SIZE: int = 256
 
     # MediaMTX WebRTC / WHEP delivery for processed streams.
     # MEDIAMTX_WEBRTC_PUBLIC_BASE must be reachable by the browser.

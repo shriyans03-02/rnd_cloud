@@ -16,6 +16,7 @@ except Exception:
     from app.services.tracking.pipeline_tracing import parse_args
 
 from app.services.tracking.service import DetectionService, PlaybackTracingService
+from app.services.mediamtx_autoconfig import maybe_generate_mediamtx_config
 
 
 @asynccontextmanager
@@ -33,6 +34,13 @@ async def lifespan(app: FastAPI):
         await init_redis()
         redis_task = asyncio.create_task(redis_listener.start_redis_listener())
         print("[Lifespan] Redis initialized")
+
+        # ---- MediaMTX dynamic camera paths ----
+        # Writes /root/mediamtx.yml from the active cameras table. MediaMTX hot-reloads the file.
+        try:
+            maybe_generate_mediamtx_config()
+        except Exception as e:
+            print(f"[MEDIAMTX-AUTO] failed: {e}")
 
         # ---- Pipeline ----
         argv = build_pipeline_argv()

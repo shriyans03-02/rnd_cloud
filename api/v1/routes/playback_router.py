@@ -1,365 +1,11 @@
-# from __future__ import annotations
-
-# import subprocess
-# import threading
-# import time
-# from datetime import datetime, timedelta, timezone
-# from typing import Optional
-# from urllib.parse import quote
-
-# from fastapi import APIRouter, HTTPException, Query, Request
-
-# from app.core.config import settings
-# from app.services.tracking.service import PlaybackTracingService
-
-# router = APIRouter()
-
-
-# # ── Helpers ───────────────────────────────────────────────────────────────────
-# def to_utc_rtsp(iso_str: str) -> str:
-#     """Convert ISO datetime string to NVR RTSP format expected by the recorder."""
-#     try:
-#         iso_str = str(iso_str).replace(" ", "+")
-#         dt = datetime.fromisoformat(iso_str)
-#         return dt.strftime("%Y%m%dT%H%M%SZ")
-#     except ValueError:
-#         clean = str(iso_str).replace("Z", "").split("+")[0]
-#         dt = datetime.fromisoformat(clean)
-#         return dt.strftime("%Y%m%dT%H%M%SZ")
-
-
-# active_streams: dict[str, subprocess.Popen] = {}
-# stream_lock = threading.Lock()
-
-
-# def _parse_iso_dt(iso_str: str) -> datetime:
-#     raw = str(iso_str or "").strip()
-#     if not raw:
-#         raise ValueError("timestamp is required")
-#     raw = raw.replace("Z", "+00:00")
-#     try:
-#         return datetime.fromisoformat(raw)
-#     except ValueError:
-#         return datetime.fromisoformat(raw.replace(" ", "+"))
-
-
-# def _channel_for_camera(camera_id: int) -> int:
-#     channel_map = settings.channel_map_dict
-#     channel = channel_map.get(int(camera_id))
-#     if not channel:
-#         raise HTTPException(
-#             status_code=400,
-#             detail=f"Invalid camera_id {camera_id}. Valid IDs: {list(channel_map.keys())}",
-#         )
-#     return int(channel)
-
-
-# def _build_rtsp_source(camera_id: int, start_time: str, end_time: str) -> str:
-#     channel = _channel_for_camera(int(camera_id))
-#     return (
-#         f"rtsp://{settings.NVR_USER}:{settings.NVR_PASS}@{settings.NVR_IP}:554"
-#         f"/Streaming/tracks/{channel}"
-#         f"?starttime={start_time}&endtime={end_time}&streamkey={settings.NVR_STREAM_KEY}"
-#     )
-
-
-# def _normalize_request_mode(
-#     request_mode: Optional[str],
-#     mode: Optional[str],
-#     member_id: Optional[int],
-#     member_name: Optional[str],
-# ) -> str:
-#     if member_id is not None or str(member_name or "").strip():
-#         return "member"
-#     raw = str(request_mode or mode or "location").strip().lower()
-#     return raw if raw in {"member", "location"} else "location"
-
-
-# def _should_annotate(
-#     annotate: bool,
-#     request_mode: Optional[str],
-#     mode: Optional[str],
-#     member_id: Optional[int],
-#     member_name: Optional[str],
-# ) -> bool:
-#     return bool(
-#         annotate
-#         or request_mode
-#         or mode
-#         or member_id is not None
-#         or str(member_name or "").strip()
-#     )
-
-
-# def _annotated_session_timeout(entry_ts: str, exit_ts: Optional[str]) -> float:
-#     if not exit_ts:
-#         return float((2 * 3600) + 180)
-#     try:
-#         start_dt = _parse_iso_dt(entry_ts)
-#         end_dt = _parse_iso_dt(exit_ts)
-#         duration = max(1.0, float((end_dt - start_dt).total_seconds()))
-#     except Exception:
-#         duration = 0.0
-#     # NVR playback may take tens of seconds before first frames appear, so keep a
-#     # generous safety window. The session still ends early once the annotated
-#     # publisher stops after the clip finishes.
-#     return float(min(max(duration + 120.0, 180.0), 4 * 3600))
-
-
-# def _public_hls_url(request: Request, stream_name: str) -> str:
-#     base = str(request.base_url).rstrip("/")
-#     return f"{base}/v1/hls/{quote(str(stream_name), safe='')}/index.m3u8"
-
-
-# def _public_mjpeg_url(request: Request, session_id: str) -> str:
-#     base = str(request.base_url).rstrip("/")
-#     return f"{base}/v1/tracking/mjpeg?session_id={quote(str(session_id), safe='')}"
-
-
-# def _get_playback_service(request: Request) -> PlaybackTracingService:
-#     svc = getattr(request.app.state, "playback_tracing_service", None)
-#     if svc is None:
-#         pipeline_args = getattr(request.app.state, "pipeline_args", None)
-#         svc = PlaybackTracingService(pipeline_args)
-#         request.app.state.playback_tracing_service = svc
-#     return svc
-
-
-# def kill_stream(stream_name: str) -> bool:
-#     proc: Optional[subprocess.Popen] = None
-#     with stream_lock:
-#         proc = active_streams.pop(str(stream_name), None)
-#     if proc is None:
-#         return False
-#     try:
-#         proc.kill()
-#         proc.wait(timeout=3)
-#     except Exception:
-#         pass
-#     return True
-
-
-# def start_ffmpeg_stream(camera_id: int, start_time: str, end_time: str, stream_name: str):
-#     _channel_for_camera(int(camera_id))
-#     rtsp_source = _build_rtsp_source(int(camera_id), str(start_time), str(end_time))
-#     rtsp_output = f"{settings.MEDIAMTX_RTSP.rstrip('/')}/{stream_name}"
-
-#     cmd = [
-#         str(getattr(settings, "FFMPEG_BIN", "ffmpeg") or "ffmpeg"),
-#         "-loglevel", "error",
-#         "-rtsp_transport", "tcp",
-#         "-fflags", "+nobuffer+discardcorrupt",
-#         "-i", rtsp_source,
-#         "-c", "copy",
-#         "-f", "rtsp",
-#         "-rtsp_transport", "tcp",
-#         rtsp_output,
-#     ]
-
-#     kill_stream(stream_name)
-
-#     try:
-#         proc = subprocess.Popen(
-#             cmd,
-#             stdout=subprocess.DEVNULL,
-#             stderr=open("ffmpeg_debug.log", "a"),
-#         )
-#         with stream_lock:
-#             active_streams[stream_name] = proc
-#     except FileNotFoundError as exc:
-#         raise RuntimeError(
-#             "FFmpeg not found. Install FFmpeg and ensure it's in PATH."
-#         ) from exc
-
-
-# # ── Routes ────────────────────────────────────────────────────────────────────
-# @router.get("/stream/playback")
-# def start_playback(
-#     request: Request,
-#     camera_id: int = Query(..., description="DB camera ID (1-4)"),
-#     entry_ts: str = Query(..., description="Entry timestamp ISO format"),
-#     exit_ts: Optional[str] = Query(None, description="Exit timestamp ISO format"),
-#     annotate: bool = Query(False, description="Re-run the ReID/annotation pipeline on playback"),
-#     request_mode: Optional[str] = Query(None, description="Playback request mode: member or location"),
-#     mode: Optional[str] = Query(None, description="Legacy alias for request_mode"),
-#     member_id: Optional[int] = Query(None, description="Target member for member-mode playback"),
-#     member_name: Optional[str] = Query(None, description="Target member name for member-mode playback"),
-# ):
-#     channel = _channel_for_camera(int(camera_id))
-#     start_time = to_utc_rtsp(entry_ts)
-
-#     if exit_ts:
-#         end_time = to_utc_rtsp(exit_ts)
-#         stream_type = "playback"
-#     else:
-#         entry_dt = _parse_iso_dt(entry_ts)
-#         if entry_dt.tzinfo is None:
-#             entry_dt = entry_dt.replace(tzinfo=timezone.utc)
-#         end_time = (entry_dt + timedelta(hours=2)).strftime("%Y%m%dT%H%M%SZ")
-#         stream_type = "live"
-
-#     if _should_annotate(annotate, request_mode, mode, member_id, member_name):
-#         rtsp_source = _build_rtsp_source(int(camera_id), str(start_time), str(end_time))
-#         resolved_mode = _normalize_request_mode(request_mode, mode, member_id, member_name)
-#         svc = _get_playback_service(request)
-
-#         try:
-#             info = svc.start_session(
-#                 rtsp_source=rtsp_source,
-#                 camera_id=int(camera_id),
-#                 start_time=str(start_time),
-#                 end_time=str(end_time),
-#                 auto_stop_seconds=_annotated_session_timeout(entry_ts, exit_ts),
-#                 member_id=member_id,
-#                 member_name=member_name,
-#                 request_mode=resolved_mode,
-#             )
-#         except Exception as exc:
-#             raise HTTPException(
-#                 status_code=500,
-#                 detail=f"Could not start the annotated playback session: {exc}",
-#             ) from exc
-
-#         session_id = str(info.get("session_id") or "").strip()
-#         stream_name = str(info.get("stream_name") or "").strip()
-#         if not session_id or not stream_name:
-#             if session_id:
-#                 try:
-#                     svc.stop_session(session_id)
-#                 except Exception:
-#                     pass
-#             raise HTTPException(
-#                 status_code=500,
-#                 detail="Annotated playback session started without a valid session identifier.",
-#             )
-
-#         return {
-#             "message": "Annotated playback session started",
-#             "data": {
-#                 "annotated": True,
-#                 "session_id": session_id,
-#                 "mjpeg_url": _public_mjpeg_url(request, session_id),
-#                 "hls_url": _public_hls_url(request, stream_name),
-#                 "stream_name": stream_name,
-#                 "stream_type": stream_type,
-#                 "start_time": start_time,
-#                 "end_time": end_time,
-#                 "camera_id": int(camera_id),
-#                 "channel": int(channel),
-#                 "request_mode": resolved_mode,
-#             },
-#         }
-
-#     stream_name = f"playback_cam{int(camera_id)}"
-
-#     thread = threading.Thread(
-#         target=start_ffmpeg_stream,
-#         args=(int(camera_id), str(start_time), str(end_time), str(stream_name)),
-#         daemon=True,
-#     )
-#     thread.start()
-#     time.sleep(4)
-
-#     with stream_lock:
-#         proc = active_streams.get(stream_name)
-#         if proc and proc.poll() is not None:
-#             raise HTTPException(
-#                 status_code=500,
-#                 detail="FFmpeg failed to start. Check NVR connection and timestamps.",
-#             )
-
-#     return {
-#         "message": "Playback stream started",
-#         "data": {
-#             "annotated": False,
-#             "session_id": None,
-#             "mjpeg_url": None,
-#             "hls_url": _public_hls_url(request, stream_name),
-#             "stream_name": stream_name,
-#             "stream_type": stream_type,
-#             "start_time": start_time,
-#             "end_time": end_time,
-#             "camera_id": int(camera_id),
-#             "channel": int(channel),
-#         },
-#     }
-
-
-# @router.delete("/stream/playback")
-# def stop_playback(
-#     request: Request,
-#     session_id: Optional[str] = Query(None, description="Annotated playback session id to stop"),
-#     stream_name: Optional[str] = Query(None, description="Raw playback stream name to stop"),
-# ):
-#     if not str(session_id or "").strip() and not str(stream_name or "").strip():
-#         raise HTTPException(
-#             status_code=422,
-#             detail="Provide either session_id or stream_name.",
-#         )
-
-#     svc = getattr(request.app.state, "playback_tracing_service", None)
-
-#     if str(session_id or "").strip() and svc is not None:
-#         if svc.stop_session(str(session_id).strip()):
-#             return {"message": f"Playback session '{str(session_id).strip()}' stopped successfully"}
-
-#     if str(stream_name or "").strip():
-#         stream_name_clean = str(stream_name).strip()
-#         if kill_stream(stream_name_clean):
-#             return {"message": f"Stream '{stream_name_clean}' stopped successfully"}
-#         if svc is not None:
-#             resolved_session_id = svc.get_session_id_by_stream_name(stream_name_clean)
-#             if resolved_session_id and svc.stop_session(resolved_session_id):
-#                 return {"message": f"Playback session '{stream_name_clean}' stopped successfully"}
-
-#     if str(session_id or "").strip():
-#         raise HTTPException(status_code=404, detail="Playback session not found")
-#     raise HTTPException(status_code=404, detail="Playback stream not found")
-
-
-# @router.get("/stream/active")
-# def list_active_streams(request: Request):
-#     with stream_lock:
-#         raw_streams = {
-#             name: {
-#                 "kind": "raw",
-#                 "pid": proc.pid,
-#                 "running": proc.poll() is None,
-#             }
-#             for name, proc in active_streams.items()
-#         }
-
-#     svc = getattr(request.app.state, "playback_tracing_service", None)
-#     annotated_sessions = svc.list_sessions() if svc is not None else []
-
-#     return {
-#         "message": "Active playback streams",
-#         "data": {
-#             "raw_streams": raw_streams,
-#             "annotated_sessions": annotated_sessions,
-#         },
-#     }
-
 """
-video_playback.py — Production-grade NVR playback router with annotated pipeline support.
+CP Plus NVR playback router with annotated tracing/WebRTC support.
 
-Production fixes applied:
-  1.  Auth guard on every route via get_current_user dependency.
-  2.  No blocking sleep in async context — asyncio.sleep + run_in_executor.
-  3.  Active-stream reaper cleans up dead ffmpeg processes.
-  4.  Per-stream rotating log file; handle closed on process exit.
-  5.  start_ffmpeg_stream raises RuntimeError on misconfiguration (HTTP 400/500).
-  6.  entry_ts < exit_ts validation.
-  7.  stream_name sanitised against path-traversal before use in URL / filesystem.
-  8.  Configurable MediaMTX timeout via settings.
-  9.  DELETE /stream/playback is idempotent (no 404 if stream already gone).
-
-Pipeline features retained from v1:
-  10. annotate / request_mode / mode / member_id / member_name query params.
-  11. PlaybackTracingService integration (annotated MJPEG + HLS sessions).
-  12. _normalize_request_mode / _should_annotate / _annotated_session_timeout helpers.
-  13. GET /stream/active surfaces both raw streams and annotated sessions.
-  14. DELETE /stream/playback handles both session_id and stream_name.
+Flow used by the tracing UI:
+  UI camera_id -> CP Plus NVR channel=<camera_id> playback RTSP
+  -> pipeline_tracing.py draws boxes/names
+  -> FFmpeg publishes processed frames to MediaMTX playback_trace_* path
+  -> MediaMTX exposes the processed path over WebRTC/HLS.
 """
 
 from __future__ import annotations
@@ -373,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
@@ -385,48 +32,128 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# ── Stream-name validation ─────────────────────────────────────────────────────
-# Allow only safe characters; prevents path-traversal in HLS proxy URLs.
-_STREAM_NAME_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
+_STREAM_NAME_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,96}$")
+_CPPLUS_TIME_FORMAT = "%Y_%m_%d_%H_%M_%S"
 
 
 def _validate_stream_name(name: str) -> str:
-    if not _STREAM_NAME_RE.match(name):
+    cleaned = str(name or "").strip()
+    if not _STREAM_NAME_RE.match(cleaned):
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Invalid stream_name. "
-                "Use only letters, digits, underscores, hyphens (max 64 chars)."
-            ),
+            detail="Invalid stream_name. Use only letters, digits, underscores, and hyphens.",
         )
-    return name
+    return cleaned
 
 
-# ── Time helpers ───────────────────────────────────────────────────────────────
-
-def to_nvr_time(iso_str: str) -> str:
-    """Convert ISO datetime string to NVR RTSP time format (YYYYMMDDTHHMMSSz)."""
-    iso_str = str(iso_str).replace(" ", "+")
+def _settings_str(name: str, default: str = "") -> str:
     try:
-        dt = datetime.fromisoformat(iso_str)
-    except ValueError:
-        clean = iso_str.replace("Z", "").split("+")[0]
-        dt = datetime.fromisoformat(clean)
-    return dt.strftime("%Y%m%dT%H%M%SZ")
+        value = getattr(settings, name)
+    except Exception:
+        value = default
+    if value is None:
+        return str(default)
+    return str(value)
 
 
-def _parse_iso_dt(iso_str: str) -> datetime:
-    raw = str(iso_str or "").strip()
+# ── CP Plus timestamp helpers ─────────────────────────────────────────────────
+
+def _nvr_tz() -> Optional[ZoneInfo]:
+    tz_name = _settings_str("NVR_PLAYBACK_TIMEZONE", "Asia/Kolkata").strip()
+    if not tz_name:
+        return None
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        logger.warning("Invalid NVR_PLAYBACK_TIMEZONE=%s; using timestamp as supplied", tz_name)
+        return None
+
+
+def _normalise_iso_text(value: str) -> str:
+    raw = str(value or "").strip()
     if not raw:
         raise ValueError("timestamp is required")
-    raw = raw.replace("Z", "+00:00")
+
+    # Browser/query-string variants seen in the app:
+    #   2026-04-24T11:30:00
+    #   2026-04-24T06:00:00.000Z
+    #   2026-04-24T11:30:00+05:30
+    #   2026-04-24T11:30:00 05:30  (when '+' was decoded as space)
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+
+    if "T" not in raw and " " in raw:
+        raw = raw.replace(" ", "T", 1)
+
+    if "T" in raw and re.search(r"\s[+\-]?\d{2}:?\d{2}$", raw):
+        left, right = raw.rsplit(" ", 1)
+        if right and right[0] not in "+-":
+            right = "+" + right
+        raw = left + right
+
+    return raw
+
+
+def _parse_iso_dt(value: str) -> datetime:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("timestamp is required")
+
+    # Accept CP Plus formatted values too, useful for direct testing/curl.
+    for fmt in (_CPPLUS_TIME_FORMAT, "%Y%m%dT%H%M%SZ"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            pass
+
+    return datetime.fromisoformat(_normalise_iso_text(raw))
+
+
+def _dt_for_compare(dt: datetime) -> datetime:
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc)
+    tz = _nvr_tz()
+    if tz is not None:
+        return dt.replace(tzinfo=tz).astimezone(timezone.utc)
+    return dt.replace(tzinfo=timezone.utc)
+
+
+def _format_cpplus_time(dt: datetime) -> str:
+    tz = _nvr_tz()
+    if dt.tzinfo is not None and tz is not None:
+        dt = dt.astimezone(tz)
+    return dt.strftime(_CPPLUS_TIME_FORMAT)
+
+
+def to_nvr_time(value: str) -> str:
+    """Return CP Plus playback time: YYYY_MM_DD_HH_MM_SS."""
+    return _format_cpplus_time(_parse_iso_dt(value))
+
+
+def _parse_and_validate_timestamps(
+    entry_ts: str,
+    exit_ts: Optional[str],
+) -> tuple[datetime, Optional[datetime]]:
     try:
-        return datetime.fromisoformat(raw)
-    except ValueError:
-        return datetime.fromisoformat(raw.replace(" ", "+"))
+        entry_dt = _parse_iso_dt(entry_ts)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"entry_ts is not valid: {exc}") from exc
+
+    exit_dt: Optional[datetime] = None
+    if exit_ts:
+        try:
+            exit_dt = _parse_iso_dt(exit_ts)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"exit_ts is not valid: {exc}") from exc
+
+        if _dt_for_compare(exit_dt) <= _dt_for_compare(entry_dt):
+            raise HTTPException(status_code=422, detail="exit_ts must be after entry_ts.")
+
+    return entry_dt, exit_dt
 
 
-# ── Process registry ───────────────────────────────────────────────────────────
+# ── Process registry for raw playback ─────────────────────────────────────────
+
 _active_streams: dict[str, subprocess.Popen] = {}
 _stream_lock = threading.Lock()
 
@@ -435,7 +162,6 @@ _LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _reap_dead_streams() -> None:
-    """Remove finished ffmpeg processes from the registry."""
     with _stream_lock:
         dead = [name for name, proc in _active_streams.items() if proc.poll() is not None]
         for name in dead:
@@ -446,11 +172,11 @@ def _reap_dead_streams() -> None:
                     log_fh.close()
                 except Exception:
                     pass
-            logger.info("Reaped dead stream: %s", name)
+            logger.info("Reaped dead playback stream: %s", name)
 
 
 def kill_stream(stream_name: str) -> bool:
-    """Kill a running stream. Returns True if it existed."""
+    stream_name = _validate_stream_name(stream_name)
     with _stream_lock:
         proc = _active_streams.get(stream_name)
         if not proc:
@@ -470,31 +196,69 @@ def kill_stream(stream_name: str) -> bool:
     return True
 
 
-# ── Channel / RTSP helpers ─────────────────────────────────────────────────────
+# ── CP Plus channel / RTSP helpers ────────────────────────────────────────────
+
+def _quote_userinfo(value: str) -> str:
+    # safe="%" lets existing encoded .env values such as Admin%40123 pass through
+    # while still encoding raw values such as Admin@123 correctly.
+    return quote(str(value or ""), safe="%")
+
 
 def _channel_for_camera(camera_id: int) -> int:
-    """Return the NVR channel for a camera ID, or raise RuntimeError."""
+    cam_id = int(camera_id)
+    if cam_id <= 0:
+        raise RuntimeError("camera_id must be a positive integer.")
+
+    mode = _settings_str("NVR_PLAYBACK_CHANNEL_SOURCE", "camera_id").strip().lower()
+    if mode in {"camera_id", "camera", "direct", "id", ""}:
+        return cam_id
+
     channel_map = settings.channel_map_dict
-    channel = channel_map.get(int(camera_id))
+    channel = channel_map.get(cam_id)
     if channel is None:
         raise RuntimeError(
-            f"No NVR channel mapped for camera_id={camera_id}. "
-            f"Valid IDs: {sorted(channel_map)}"
+            f"No NVR channel mapped for camera_id={cam_id}. "
+            f"Either set NVR_PLAYBACK_CHANNEL_SOURCE=camera_id for CP Plus direct channels "
+            f"or add camera_id:channel to CHANNEL_MAP. Valid mapped IDs: {sorted(channel_map)}"
         )
     return int(channel)
 
 
 def _build_rtsp_source(camera_id: int, start_time: str, end_time: str) -> str:
     channel = _channel_for_camera(int(camera_id))
-    return (
-        f"rtsp://{settings.NVR_USER}:{settings.NVR_PASS}@{settings.NVR_IP}:554"
-        f"/Streaming/tracks/{channel}"
-        f"?starttime={start_time}&endtime={end_time}"
-        f"&streamkey={settings.NVR_STREAM_KEY}"
-    )
+    path = _settings_str("NVR_PLAYBACK_PATH", "/cam/playback").strip() or "/cam/playback"
+    if not path.startswith("/"):
+        path = "/" + path
+
+    values = {
+        "username": _quote_userinfo(_settings_str("NVR_USER", "admin")),
+        "password": _quote_userinfo(_settings_str("NVR_PASS", "")),
+        "ip": _settings_str("NVR_IP", "").strip(),
+        "port": _settings_str("NVR_PORT", "554").strip() or "554",
+        "path": path,
+        "channel": int(channel),
+        "camera_id": int(camera_id),
+        "starttime": str(start_time),
+        "endtime": str(end_time),
+    }
+
+    if not values["ip"]:
+        raise RuntimeError("NVR_IP is required for CP Plus playback.")
+
+    template = _settings_str(
+        "NVR_PLAYBACK_URL_TEMPLATE",
+        "rtsp://{username}:{password}@{ip}:{port}/cam/playback?channel={channel}&starttime={starttime}&endtime={endtime}",
+    ).strip()
+    if not template:
+        template = "rtsp://{username}:{password}@{ip}:{port}{path}?channel={channel}&starttime={starttime}&endtime={endtime}"
+
+    try:
+        return template.format(**values)
+    except Exception as exc:
+        raise RuntimeError(f"Invalid NVR_PLAYBACK_URL_TEMPLATE: {exc}") from exc
 
 
-# ── FFmpeg launcher ────────────────────────────────────────────────────────────
+# ── Raw FFmpeg launcher ───────────────────────────────────────────────────────
 
 def start_ffmpeg_stream(
     camera_id: int,
@@ -502,10 +266,7 @@ def start_ffmpeg_stream(
     end_time: str,
     stream_name: str,
 ) -> None:
-    """
-    Launch ffmpeg pulling from NVR RTSP and pushing into MediaMTX.
-    Raises RuntimeError on misconfiguration so callers can surface HTTP 400/500.
-    """
+    stream_name = _validate_stream_name(stream_name)
     rtsp_source = _build_rtsp_source(int(camera_id), str(start_time), str(end_time))
     rtsp_output = f"{settings.MEDIAMTX_RTSP.rstrip('/')}/{stream_name}"
 
@@ -537,14 +298,12 @@ def start_ffmpeg_stream(
         proc._log_fh = log_fh  # type: ignore[attr-defined]
         with _stream_lock:
             _active_streams[stream_name] = proc
-        logger.info("Started ffmpeg stream %s (pid=%d)", stream_name, proc.pid)
-    except FileNotFoundError:
-        raise RuntimeError(
-            "ffmpeg not found. Install ffmpeg and ensure it is in PATH."
-        )
+        logger.info("Started CP Plus playback ffmpeg stream %s (pid=%d)", stream_name, proc.pid)
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffmpeg not found. Install ffmpeg and ensure it is in PATH.") from exc
 
 
-# ── Annotated-pipeline helpers (preserved from v1) ────────────────────────────
+# ── Annotated-pipeline helpers ────────────────────────────────────────────────
 
 def _normalize_request_mode(
     request_mode: Optional[str],
@@ -578,8 +337,8 @@ def _annotated_session_timeout(entry_ts: str, exit_ts: Optional[str]) -> float:
     if not exit_ts:
         return float(2 * 3600 + 180)
     try:
-        start_dt = _parse_iso_dt(entry_ts)
-        end_dt = _parse_iso_dt(exit_ts)
+        start_dt = _dt_for_compare(_parse_iso_dt(entry_ts))
+        end_dt = _dt_for_compare(_parse_iso_dt(exit_ts))
         duration = max(1.0, float((end_dt - start_dt).total_seconds()))
     except Exception:
         duration = 0.0
@@ -597,7 +356,7 @@ def _public_mjpeg_url(request: Request, session_id: str) -> str:
 
 
 def _public_webrtc_base(request: Request) -> str:
-    configured = str(getattr(settings, "MEDIAMTX_WEBRTC_PUBLIC_BASE", "") or "").strip().rstrip("/")
+    configured = _settings_str("MEDIAMTX_WEBRTC_PUBLIC_BASE", "").strip().rstrip("/")
     if configured:
         return configured
     host = request.url.hostname or "localhost"
@@ -623,38 +382,37 @@ def _get_playback_service(request: Request) -> PlaybackTracingService:
     return svc
 
 
-# ── Timestamp parsing helper ───────────────────────────────────────────────────
-
-def _parse_and_validate_timestamps(
-    entry_ts: str,
-    exit_ts: Optional[str],
-) -> tuple[datetime, Optional[datetime]]:
-    """
-    Parse entry/exit timestamps, ensure timezone-awareness, and validate ordering.
-    Raises HTTPException 422 on bad input.
-    """
-    try:
-        entry_dt = datetime.fromisoformat(entry_ts.replace("Z", "+00:00"))
-    except ValueError:
-        raise HTTPException(status_code=422, detail="entry_ts is not a valid ISO 8601 datetime.")
-
-    if entry_dt.tzinfo is None:
-        entry_dt = entry_dt.replace(tzinfo=timezone.utc)
-
-    exit_dt: Optional[datetime] = None
-    if exit_ts:
-        try:
-            exit_dt = datetime.fromisoformat(exit_ts.replace("Z", "+00:00"))
-        except ValueError:
-            raise HTTPException(status_code=422, detail="exit_ts is not a valid ISO 8601 datetime.")
-
-        if exit_dt.tzinfo is None:
-            exit_dt = exit_dt.replace(tzinfo=timezone.utc)
-
-        if exit_dt <= entry_dt:
-            raise HTTPException(status_code=422, detail="exit_ts must be after entry_ts.")
-
-    return entry_dt, exit_dt
+def _response_payload(
+    *,
+    request: Request,
+    annotated: bool,
+    session_id: Optional[str],
+    stream_name: str,
+    stream_type: str,
+    start_time: str,
+    end_time: str,
+    camera_id: int,
+    channel: int,
+    request_mode: Optional[str] = None,
+) -> dict:
+    data = {
+        "annotated": bool(annotated),
+        "session_id": session_id,
+        "mjpeg_url": _public_mjpeg_url(request, session_id) if session_id else None,
+        "hls_url": _public_hls_url(request, stream_name),
+        "webrtc_url": _public_webrtc_url(request, stream_name),
+        "whep_url": _public_whep_url(request, stream_name),
+        "stream_name": stream_name,
+        "stream_type": stream_type,
+        "start_time": start_time,
+        "end_time": end_time,
+        "camera_id": int(camera_id),
+        "channel": int(channel),
+        "nvr_vendor": "cpplus",
+    }
+    if request_mode:
+        data["request_mode"] = request_mode
+    return data
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -662,38 +420,37 @@ def _parse_and_validate_timestamps(
 @router.get("/stream/playback")
 async def start_playback(
     request: Request,
-    camera_id: int = Query(..., description="DB camera ID"),
-    entry_ts: str = Query(..., description="Entry timestamp (ISO 8601)"),
-    exit_ts: Optional[str] = Query(None, description="Exit timestamp (ISO 8601); omit for live"),
-    # ── Annotated-pipeline params ──────────────────────────────────────────
-    annotate: bool = Query(False, description="Re-run the ReID/annotation pipeline on playback"),
+    camera_id: int = Query(..., description="DB camera ID; CP Plus channel uses this same value by default"),
+    entry_ts: str = Query(..., description="Entry timestamp"),
+    exit_ts: Optional[str] = Query(None, description="Exit timestamp; omit for a 2-hour window"),
+    annotate: bool = Query(False, description="Run pipeline_tracing.py and publish processed frames"),
     request_mode: Optional[str] = Query(None, description="Playback mode: member or location"),
     mode: Optional[str] = Query(None, description="Legacy alias for request_mode"),
-    member_id: Optional[int] = Query(None, description="Target member ID (member-mode)"),
-    member_name: Optional[str] = Query(None, description="Target member name (member-mode)"),
+    member_id: Optional[int] = Query(None, description="Target member ID for member mode"),
+    member_name: Optional[str] = Query(None, description="Target member name for member mode"),
     current_user: User = Depends(get_current_user),
 ):
-    # ── Validate camera ──────────────────────────────────────────────────────
     try:
         channel = _channel_for_camera(int(camera_id))
     except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # ── Parse & validate timestamps ──────────────────────────────────────────
     entry_dt, exit_dt = _parse_and_validate_timestamps(entry_ts, exit_ts)
+    start_time = _format_cpplus_time(entry_dt)
 
     if exit_dt is not None:
-        start_time = to_nvr_time(entry_ts)
-        end_time = to_nvr_time(exit_ts)  # type: ignore[arg-type]
+        end_time = _format_cpplus_time(exit_dt)
         stream_type = "playback"
     else:
-        start_time = to_nvr_time(entry_ts)
-        end_time = (entry_dt + timedelta(hours=2)).strftime("%Y%m%dT%H%M%SZ")
+        end_time = _format_cpplus_time(entry_dt + timedelta(hours=2))
         stream_type = "live"
 
-    # ── Annotated pipeline path ──────────────────────────────────────────────
     if _should_annotate(annotate, request_mode, mode, member_id, member_name):
-        rtsp_source = _build_rtsp_source(int(camera_id), str(start_time), str(end_time))
+        try:
+            rtsp_source = _build_rtsp_source(int(camera_id), start_time, end_time)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         resolved_mode = _normalize_request_mode(request_mode, mode, member_id, member_name)
         svc = _get_playback_service(request)
 
@@ -703,8 +460,8 @@ async def start_playback(
                 lambda: svc.start_session(
                     rtsp_source=rtsp_source,
                     camera_id=int(camera_id),
-                    start_time=str(start_time),
-                    end_time=str(end_time),
+                    start_time=start_time,
+                    end_time=end_time,
                     auto_stop_seconds=_annotated_session_timeout(entry_ts, exit_ts),
                     member_id=member_id,
                     member_name=member_name,
@@ -714,12 +471,11 @@ async def start_playback(
         except Exception as exc:
             raise HTTPException(
                 status_code=500,
-                detail=f"Could not start the annotated playback session: {exc}",
+                detail=f"Could not start the annotated CP Plus playback session: {exc}",
             ) from exc
 
         session_id = str(info.get("session_id") or "").strip()
         stream_name = str(info.get("stream_name") or "").strip()
-
         if not session_id or not stream_name:
             if session_id:
                 try:
@@ -728,29 +484,25 @@ async def start_playback(
                     pass
             raise HTTPException(
                 status_code=500,
-                detail="Annotated playback session started without a valid session identifier.",
+                detail="Annotated playback session started without a valid session/stream identifier.",
             )
 
         return {
-            "message": "Annotated playback session started",
-            "data": {
-                "annotated": True,
-                "session_id": session_id,
-                "mjpeg_url": _public_mjpeg_url(request, session_id),
-                "hls_url": _public_hls_url(request, stream_name),
-                "webrtc_url": _public_webrtc_url(request, stream_name),
-                "whep_url": _public_whep_url(request, stream_name),
-                "stream_name": stream_name,
-                "stream_type": stream_type,
-                "start_time": start_time,
-                "end_time": end_time,
-                "camera_id": int(camera_id),
-                "channel": int(channel),
-                "request_mode": resolved_mode,
-            },
+            "message": "Annotated CP Plus playback session started",
+            "data": _response_payload(
+                request=request,
+                annotated=True,
+                session_id=session_id,
+                stream_name=stream_name,
+                stream_type=stream_type,
+                start_time=start_time,
+                end_time=end_time,
+                camera_id=int(camera_id),
+                channel=int(channel),
+                request_mode=resolved_mode,
+            ),
         }
 
-    # ── Raw ffmpeg path ──────────────────────────────────────────────────────
     stream_name = f"playback_cam{int(camera_id)}"
 
     try:
@@ -758,14 +510,13 @@ async def start_playback(
             None,
             start_ffmpeg_stream,
             int(camera_id),
-            str(start_time),
-            str(end_time),
+            start_time,
+            end_time,
             stream_name,
         )
     except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    # Brief async wait for ffmpeg to start piping into MediaMTX.
     await asyncio.sleep(3)
 
     with _stream_lock:
@@ -778,32 +529,29 @@ async def start_playback(
             tail = log_path.read_text()[-800:]
         except Exception:
             pass
-        logger.error("ffmpeg exited early for %s. Log tail:\n%s", stream_name, tail)
+        logger.error("CP Plus ffmpeg exited early for %s. Log tail:\n%s", stream_name, tail)
         raise HTTPException(
             status_code=500,
             detail=(
-                "ffmpeg failed to start. "
-                "Check NVR connection, channel mapping and timestamps. "
+                "ffmpeg failed to start CP Plus playback. "
+                "Check NVR_IP, camera/channel ID, timestamps, and CP Plus playback permissions. "
                 f"Log: {tail or '(no log)'}"
             ),
         )
 
     return {
-        "message": "Playback stream started",
-        "data": {
-            "annotated": False,
-            "session_id": None,
-            "mjpeg_url": None,
-            "hls_url": _public_hls_url(request, stream_name),
-            "webrtc_url": _public_webrtc_url(request, stream_name),
-            "whep_url": _public_whep_url(request, stream_name),
-            "stream_name": stream_name,
-            "stream_type": stream_type,
-            "start_time": start_time,
-            "end_time": end_time,
-            "camera_id": int(camera_id),
-            "channel": int(channel),
-        },
+        "message": "CP Plus playback stream started",
+        "data": _response_payload(
+            request=request,
+            annotated=False,
+            session_id=None,
+            stream_name=stream_name,
+            stream_type=stream_type,
+            start_time=start_time,
+            end_time=end_time,
+            camera_id=int(camera_id),
+            channel=int(channel),
+        ),
     }
 
 
@@ -811,42 +559,32 @@ async def start_playback(
 async def stop_playback(
     request: Request,
     session_id: Optional[str] = Query(None, description="Annotated playback session ID to stop"),
-    stream_name: Optional[str] = Query(None, description="Raw playback stream name to stop"),
+    stream_name: Optional[str] = Query(None, description="Raw/processed stream name to stop"),
     current_user: User = Depends(get_current_user),
 ):
     session_id_clean = str(session_id or "").strip()
     stream_name_clean = str(stream_name or "").strip()
 
     if not session_id_clean and not stream_name_clean:
-        raise HTTPException(
-            status_code=422,
-            detail="Provide either session_id or stream_name.",
-        )
+        raise HTTPException(status_code=422, detail="Provide either session_id or stream_name.")
 
     if stream_name_clean:
         _validate_stream_name(stream_name_clean)
 
-    svc: Optional[PlaybackTracingService] = getattr(
-        request.app.state, "playback_tracing_service", None
-    )
+    svc: Optional[PlaybackTracingService] = getattr(request.app.state, "playback_tracing_service", None)
 
-    # ── Try annotated session by session_id ──────────────────────────────────
     if session_id_clean and svc is not None:
         if svc.stop_session(session_id_clean):
             return {"message": f"Playback session '{session_id_clean}' stopped successfully."}
 
-    # ── Try raw stream by stream_name ────────────────────────────────────────
     if stream_name_clean:
         if kill_stream(stream_name_clean):
             return {"message": f"Stream '{stream_name_clean}' stopped successfully."}
-
-        # Fall back: stream_name might belong to an annotated session.
         if svc is not None:
             resolved_sid = svc.get_session_id_by_stream_name(stream_name_clean)
             if resolved_sid and svc.stop_session(resolved_sid):
                 return {"message": f"Playback session for stream '{stream_name_clean}' stopped successfully."}
 
-    # ── Idempotent: not found is still OK ────────────────────────────────────
     target = session_id_clean or stream_name_clean
     return {"message": f"'{target}' was not running."}
 
@@ -871,9 +609,7 @@ async def list_active_streams(
             for name, proc in _active_streams.items()
         }
 
-    svc: Optional[PlaybackTracingService] = getattr(
-        request.app.state, "playback_tracing_service", None
-    )
+    svc: Optional[PlaybackTracingService] = getattr(request.app.state, "playback_tracing_service", None)
     annotated_sessions = svc.list_sessions() if svc is not None else []
 
     return {

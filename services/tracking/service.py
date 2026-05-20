@@ -553,13 +553,81 @@ class AnnotatedRtspPublisher:
             frame = cv2.resize(frame, (int(out_w), int(out_h)), interpolation=cv2.INTER_LINEAR)
         return np.ascontiguousarray(frame)
 
+    def _make_placeholder_frame(self) -> np.ndarray:
+        if self._size is None:
+            w = int(getattr(settings, "TRACKING_WEBRTC_WIDTH", 852) or 852)
+            h = int(getattr(settings, "TRACKING_WEBRTC_HEIGHT", 480) or 480)
+            self._size = self._even_size(w, h)
+        w, h = self._size
+        frame = np.zeros((int(h), int(w), 3), dtype=np.uint8)
+        cv2.putText(
+            frame,
+            "Waiting for CP Plus playback frames...",
+            (24, max(40, int(h // 2))),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (220, 220, 220),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            self.stream_name,
+            (24, max(72, int(h // 2) + 34)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (160, 160, 160),
+            1,
+            cv2.LINE_AA,
+        )
+        return np.ascontiguousarray(frame)
+
+    def _ensure_proc_for_frame(self, frame_bgr: np.ndarray) -> bool:
+        if self._proc is None:
+            try:
+                self._start_proc(frame_bgr.shape[1], frame_bgr.shape[0])
+            except Exception as exc:
+                self._error = f"ffmpeg start failed: {exc}"
+                return False
+        if self._proc is None or self._proc.stdin is None:
+            self._error = "ffmpeg stdin not available"
+            return False
+        if self._proc.poll() is not None:
+            self._error = f"ffmpeg exited early with code {self._proc.returncode}"
+            return False
+        return True
+
+    def _write_frame_to_proc(self, frame_bgr: np.ndarray) -> bool:
+        if not self._ensure_proc_for_frame(frame_bgr):
+            return False
+        assert self._proc is not None and self._proc.stdin is not None
+        try:
+            self._proc.stdin.write(frame_bgr.tobytes())
+        except (BrokenPipeError, OSError) as exc:
+            self._error = f"ffmpeg pipe failed: {exc}"
+            return False
+        self._started_writes += 1
+        self._ready_evt.set()
+        return True
+
     def _loop(self) -> None:
         idle_loops = 0
+        max_idle_loops = max(20, int(self.fps * 10.0))
+        wait_timeout = min(0.5, max(0.02, 1.0 / max(1.0, float(self.fps))))
         self.buffer.add_client()
         try:
+            # Start the MediaMTX publisher immediately with a placeholder frame.
+            # Without this bootstrap, the browser can open the WebRTC page before
+            # the first NVR frame is decoded and see an unavailable path.
+            try:
+                placeholder = self._prepare_frame(self._make_placeholder_frame())
+                self._write_frame_to_proc(placeholder)
+            except Exception:
+                pass
+
             while not self._stop_evt.is_set():
                 try:
-                    frame, _ts, _meta, seq = self.buffer.wait_for_seq(self._last_seq, timeout=0.5)
+                    frame, _ts, _meta, seq = self.buffer.wait_for_seq(self._last_seq, timeout=wait_timeout)
                 except Exception as exc:
                     self._error = f"buffer wait failed: {exc}"
                     break
@@ -569,20 +637,22 @@ class AnnotatedRtspPublisher:
 
                 if frame is None or int(seq) <= int(self._last_seq):
                     idle_loops += 1
-                    if idle_loops >= 20:
+                    if self._proc is not None and self._proc.stdin is not None and self._proc.poll() is None:
+                        try:
+                            placeholder = self._prepare_frame(self._make_placeholder_frame())
+                            if not self._write_frame_to_proc(placeholder):
+                                break
+                        except Exception:
+                            pass
+                    if idle_loops >= max_idle_loops:
                         # Do not tear the session down just because annotated
                         # playback has a long decode gap. NVR playback often
                         # starts mid-GOP, so OpenCV can sit on decoder errors
-                        # until the next clean keyframe arrives. Breaking here
-                        # freezes MJPEG playback on the first annotated frame.
-                        #
-                        # The session is cleaned up by the explicit DELETE route
-                        # or the session auto-stop timer. If the underlying
-                        # runner has already stopped before we ever published a
-                        # frame, we can still exit early.
+                        # until the next clean keyframe arrives. The session is
+                        # cleaned by DELETE or auto-stop.
                         if self._started_writes <= 0 and (not self._runner_running()):
                             break
-                        idle_loops = 20
+                        idle_loops = max_idle_loops
                     continue
 
                 idle_loops = 0
@@ -594,30 +664,8 @@ class AnnotatedRtspPublisher:
                     self._error = f"frame prepare failed: {exc}"
                     break
 
-                if self._proc is None:
-                    try:
-                        self._start_proc(frame_bgr.shape[1], frame_bgr.shape[0])
-                    except Exception as exc:
-                        self._error = f"ffmpeg start failed: {exc}"
-                        break
-
-                if self._proc is None or self._proc.stdin is None:
-                    self._error = "ffmpeg stdin not available"
+                if not self._write_frame_to_proc(frame_bgr):
                     break
-
-                if self._proc.poll() is not None:
-                    self._error = f"ffmpeg exited early with code {self._proc.returncode}"
-                    break
-
-                try:
-                    self._proc.stdin.write(frame_bgr.tobytes())
-                except (BrokenPipeError, OSError) as exc:
-                    self._error = f"ffmpeg pipe failed: {exc}"
-                    break
-
-                self._started_writes += 1
-                if self._started_writes >= 1:
-                    self._ready_evt.set()
         finally:
             try:
                 self.buffer.remove_client()

@@ -47,11 +47,25 @@ class Settings(BaseSettings):
     TICKET_TTL: int = 30
     REFRESH_TTL: int = 604800
 
-    # NVR config
+    # NVR / CP Plus playback config
     NVR_IP: str = ""
     NVR_USER: str = ""
     NVR_PASS: str = ""
+    NVR_PORT: str = "554"
+    # Kept for legacy Hikvision deployments; CP Plus playback does not use it.
     NVR_STREAM_KEY: str = ""
+    # CP Plus playback URL example:
+    # rtsp://admin:Admin%40123@192.168.1.245:554/cam/playback?channel=1&starttime=2026_04_24_11_30_00&endtime=2026_04_24_12_00_00
+    NVR_PLAYBACK_PATH: str = "/cam/playback"
+    NVR_PLAYBACK_URL_TEMPLATE: str = (
+        "rtsp://{username}:{password}@{ip}:{port}/cam/playback"
+        "?channel={channel}&starttime={starttime}&endtime={endtime}"
+    )
+    # CP Plus site convention: the UI camera_id is the NVR channel number.
+    # Set to "channel_map" only if you want CHANNEL_MAP camera_id:channel overrides.
+    NVR_PLAYBACK_CHANNEL_SOURCE: str = "camera_id"
+    # Used when timestamps arrive with UTC offsets/Z; naive timestamps are used as-is.
+    NVR_PLAYBACK_TIMEZONE: str = "Asia/Kolkata"
 
     # MediaMTX
     MEDIAMTX_RTSP: str = "rtsp://localhost:8554"

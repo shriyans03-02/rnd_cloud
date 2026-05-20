@@ -65,6 +65,33 @@ class Settings(BaseSettings):
     MEDIAMTX_SOURCE_ON_DEMAND: bool = True
     MEDIAMTX_CAMERA_RTSP_TRANSPORT: str = "tcp"
     MEDIAMTX_WRITE_QUEUE_SIZE: int = 256
+    # Optional: let FastAPI start MediaMTX if port 8554 is not already open.
+    MEDIAMTX_AUTOSTART: bool = True
+    MEDIAMTX_BIN: str = "./mediamtx"
+    MEDIAMTX_START_WAIT_SECONDS: float = 8.0
+
+    # Optional NVDEC/H265 restream stage:
+    # DB camera -> MediaMTX live/cam<ID> -> FFmpeg NVDEC restream -> MediaMTX ai/cam<ID>
+    # Pipeline can then read ai/cam<ID>, which is lower-res clean H264.
+    NVDEC_RESTREAM_ENABLED: bool = False
+    NVDEC_RESTREAM_INPUT_CODEC: str = "hevc"  # hevc or h264
+    NVDEC_RESTREAM_DECODER: str = "auto"      # auto, hevc_cuvid, h264_cuvid
+    NVDEC_RESTREAM_ENCODER: str = "libx264"   # libx264 or h264_nvenc if available
+    NVDEC_RESTREAM_WIDTH: int = 852
+    NVDEC_RESTREAM_HEIGHT: int = 480
+    NVDEC_RESTREAM_FPS: int = 20
+    NVDEC_RESTREAM_BITRATE: str = "1200k"
+    NVDEC_RESTREAM_BUFSIZE: str = "2400k"
+    NVDEC_RESTREAM_GOP: int = 20
+    NVDEC_RESTREAM_PRESET: str = "ultrafast"
+    NVDEC_RESTREAM_USE_GPU_SCALE: bool = True
+    NVDEC_RESTREAM_LOG_DIR: str = "logs/nvdec_restream"
+    NVDEC_RESTREAM_INPUT_PREFIX: str = "live/cam"
+    NVDEC_RESTREAM_OUTPUT_PREFIX: str = "ai/cam"
+    NVDEC_RESTREAM_WARMUP_SECONDS: float = 5.0
+    NVDEC_RESTREAM_RESTART_SECONDS: float = 2.0
+    NVDEC_RESTREAM_MAX_CAMERAS: int = 0
+    NVDEC_RESTREAM_CAMERA_IDS: str = ""
 
     # MediaMTX WebRTC / WHEP delivery for processed streams.
     # MEDIAMTX_WEBRTC_PUBLIC_BASE must be reachable by the browser.

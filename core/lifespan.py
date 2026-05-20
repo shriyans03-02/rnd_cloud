@@ -17,6 +17,8 @@ except Exception:
 
 from app.services.tracking.service import DetectionService, PlaybackTracingService
 from app.services.mediamtx_autoconfig import maybe_generate_mediamtx_config
+from app.services.mediamtx_runtime import maybe_start_mediamtx
+from app.services.nvdec_restreamer import NVDecRestreamManager
 
 
 @asynccontextmanager
@@ -28,6 +30,8 @@ async def lifespan(app: FastAPI):
     svc: Optional[DetectionService] = None
     playback_svc: Optional[PlaybackTracingService] = None
     redis_task: Optional[asyncio.Task] = None
+    mediamtx_proc = None
+    nvdec_mgr: Optional[NVDecRestreamManager] = None
 
     try:
         # ---- Redis ----
@@ -36,11 +40,27 @@ async def lifespan(app: FastAPI):
         print("[Lifespan] Redis initialized")
 
         # ---- MediaMTX dynamic camera paths ----
-        # Writes /root/mediamtx.yml from the active cameras table. MediaMTX hot-reloads the file.
+        # Writes mediamtx.yml from the active cameras table.
         try:
             maybe_generate_mediamtx_config()
         except Exception as e:
             print(f"[MEDIAMTX-AUTO] failed: {e}")
+
+        # ---- MediaMTX process ----
+        # If MEDIAMTX_AUTOSTART=True and port 8554 is not open, start ./mediamtx automatically.
+        try:
+            mediamtx_proc = maybe_start_mediamtx()
+        except Exception as e:
+            print(f"[MEDIAMTX] autostart failed: {e}")
+
+        # ---- Optional NVDEC/H265 restreamers ----
+        # This creates ai/cam<ID> streams from live/cam<ID> streams before the Python pipeline opens sources.
+        try:
+            if NVDecRestreamManager.enabled():
+                nvdec_mgr = NVDecRestreamManager.from_env()
+                nvdec_mgr.start()
+        except Exception as e:
+            print(f"[NVDEC] startup failed: {e}")
 
         # ---- Pipeline ----
         argv = build_pipeline_argv()
@@ -84,6 +104,20 @@ async def lifespan(app: FastAPI):
                 svc.stop()
             except Exception as e:
                 print(f"[Lifespan] Stop detection service failed: {e}")
+
+        # ---- Stop NVDEC restreamers ----
+        if nvdec_mgr is not None:
+            try:
+                nvdec_mgr.stop()
+            except Exception as e:
+                print(f"[NVDEC] stop failed: {e}")
+
+        # ---- Stop MediaMTX if this process started it ----
+        if mediamtx_proc is not None:
+            try:
+                mediamtx_proc.stop()
+            except Exception as e:
+                print(f"[MEDIAMTX] stop failed: {e}")
 
         # ---- Close Redis ----
         await close_redis()

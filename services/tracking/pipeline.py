@@ -8595,9 +8595,9 @@ def _build_direct_rtsp_url_from_ip(ip: str) -> str:
 def resolve_auto_db_camera_sources(args: argparse.Namespace) -> argparse.Namespace:
     """Fill args.src/args.camera_ids from the cameras table when --src is omitted.
 
-    Production default is mediamtx-id mode:
+    Production default is mediamtx-id mode, or mediamtx-ai-id when NVDEC restreaming is enabled:
         DB camera id 19 -> rtsp://127.0.0.1:8554/live/cam19
-        DB camera id 20 -> rtsp://127.0.0.1:8554/live/cam20
+        DB camera id 19 + NVDEC -> rtsp://127.0.0.1:8554/ai/cam19
 
     This removes every hard-coded camera URL and every hard-coded camera ID from
     pipeline_args. The cameras table becomes the source of truth.
@@ -8674,6 +8674,9 @@ def resolve_auto_db_camera_sources(args: argparse.Namespace) -> argparse.Namespa
             src = _build_direct_rtsp_url_from_ip(ip)
         elif mode == "mediamtx":
             src = f"{prefix}{idx}"
+        elif mode == "mediamtx-ai-id":
+            ai_prefix = str(getattr(args, "mediamtx_ai_prefix", "") or "").strip() or "rtsp://127.0.0.1:8554/ai/cam"
+            src = f"{ai_prefix}{cam_id}"
         else:
             src = f"{prefix}{cam_id}"
         sources.append(src)
@@ -12653,8 +12656,9 @@ def parse_args(argv: Optional[List[str]] = None):
     ap.add_argument("--camera-ids", nargs="+", type=int, default=[], help="DB camera_ids aligned with --src order. If --src is omitted, these IDs select/order DB cameras.")
     ap.add_argument("--auto-db-cameras", action=argparse.BooleanOptionalAction, default=True, help="When --src is omitted, load active cameras from the cameras table and build sources automatically.")
     ap.add_argument("--auto-db-camera-limit", type=int, default=0, help="Max active DB cameras to run when --src is omitted. 0=all selected/active cameras.")
-    ap.add_argument("--db-camera-source-mode", choices=["mediamtx-id", "mediamtx", "direct"], default="mediamtx-id", help="Auto DB camera source mode: mediamtx-id uses rtsp://127.0.0.1:8554/live/cam<ID>; mediamtx uses live/camN; direct builds RTSP URLs from DB IPs.")
+    ap.add_argument("--db-camera-source-mode", choices=["mediamtx-id", "mediamtx-ai-id", "mediamtx", "direct"], default="mediamtx-id", help="Auto DB camera source mode: mediamtx-id uses rtsp://127.0.0.1:8554/live/cam<ID>; mediamtx-ai-id uses rtsp://127.0.0.1:8554/ai/cam<ID>; mediamtx uses live/camN; direct builds RTSP URLs from DB IPs.")
     ap.add_argument("--mediamtx-live-prefix", default="rtsp://127.0.0.1:8554/live/cam", help="Prefix used in auto DB mediamtx mode. Camera rank N becomes <prefix>N.")
+    ap.add_argument("--mediamtx-ai-prefix", default="rtsp://127.0.0.1:8554/ai/cam", help="Prefix used in auto DB mediamtx-ai-id mode. Camera ID becomes <prefix><ID>.")
     ap.add_argument("--db-camera-order", choices=["selected", "ip", "id"], default="id", help="Ordering for auto DB cameras. selected preserves --camera-ids order; otherwise sort by IP or ID. Default id keeps live/cam<ID> stable.")
 
     ap.add_argument("--use-db", action="store_true", help="Enable DB gallery.")

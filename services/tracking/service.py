@@ -1137,7 +1137,7 @@ class PlaybackTraceSession:
     auto_stop_at: float
     runner: TrackingRunner
     buffer: Optional[RenderedFrame]
-    publisher: Optional[AnnotatedRtspPublisher]
+    publisher: Optional[Any]
     clean_restream: Optional[PlaybackCleanRestream]
 
 
@@ -1394,13 +1394,15 @@ class PlaybackTracingService:
         # keep Unknown boxes visible instead of returning a clean video with all
         # boxes hidden. This avoids perceived information loss while still
         # preventing the CUDA crash path.
+        # Always keep boxes visible in playback.  Member-mode still filters the
+        # DB gallery to the requested member, but unknown/unconfirmed people must
+        # stay visible with tracker IDs; otherwise the user sees a clean video
+        # with no boxes until face recognition confirms a name.
+        args.hide_unknown = False
         if str(request_mode) == "member":
-            args.hide_unknown = bool(getattr(args, "use_face", False))
             args.face_confirm_hits = 1
             args.face_switch_confirm_hits = 1
             args.camera_name_switch_hits = 1
-        else:
-            args.hide_unknown = False
 
         return args
 
@@ -1581,6 +1583,10 @@ class PlaybackTracingService:
             raise
 
         buf = runner.get_camera_buffer(int(camera_id))
+        try:
+            raw_buf = runner.get_camera_raw_buffer(int(camera_id))
+        except Exception:
+            raw_buf = None
         if buf is None:
             try:
                 runner.stop()
@@ -1593,14 +1599,28 @@ class PlaybackTracingService:
                     pass
             raise RuntimeError(f"Camera buffer not available for camera_id={int(camera_id)}")
 
-        publisher = AnnotatedRtspPublisher(
+        # Publish playback_trace_* in hybrid mode: raw clean H264 frames provide
+        # smooth motion at WebRTC FPS, while the latest AI metadata is overlaid
+        # as soon as detection finishes.  This avoids the slow-motion effect
+        # caused by publishing only the processed/detected frame cadence.
+        publisher = ProcessedFrameRtspPublisher(
             buffer=buf,
-            runner=runner,
+            raw_buffer=raw_buf,
             stream_name=stream_name,
             ffmpeg_bin=str(getattr(settings, "FFMPEG_BIN", "ffmpeg") or "ffmpeg"),
             mediamtx_rtsp_base=str(getattr(settings, "MEDIAMTX_RTSP", "") or ""),
-            fps=float(getattr(args, "video_fps", 20.0) or 20.0),
-            codec=_setting_str("PLAYBACK_WEBRTC_CODEC", "libx264") or "libx264",
+            mode=_setting_str("PLAYBACK_WEBRTC_MODE", "hybrid") or "hybrid",
+            fps=_setting_float("PLAYBACK_WEBRTC_FPS", float(getattr(args, "video_fps", 20.0) or 20.0)),
+            width=_setting_int("PLAYBACK_WEBRTC_WIDTH", 1280),
+            height=_setting_int("PLAYBACK_WEBRTC_HEIGHT", 720),
+            codec=_setting_str("PLAYBACK_WEBRTC_CODEC", "auto") or "auto",
+            bitrate=_setting_str("PLAYBACK_WEBRTC_BITRATE", "6000k") or "6000k",
+            bufsize=_setting_str("PLAYBACK_WEBRTC_BUFSIZE", "12000k") or "12000k",
+            x264_preset=_setting_str("PLAYBACK_WEBRTC_PRESET", "ultrafast") or "ultrafast",
+            overlay_max_age_ms=_setting_int("PLAYBACK_WEBRTC_OVERLAY_MAX_AGE_MS", 2500),
+            gop=_setting_int("PLAYBACK_WEBRTC_GOP", 40),
+            draw_stats=_setting_bool("PLAYBACK_OVERLAY_FPS", True),
+            log_dir=_setting_str("PLAYBACK_WEBRTC_LOG_DIR", "logs/playback_webrtc") or "logs/playback_webrtc",
         )
         try:
             publisher.start()

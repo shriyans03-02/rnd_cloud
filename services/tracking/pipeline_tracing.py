@@ -1994,6 +1994,7 @@ class AdaptiveQueueStream:
         reconnect_max_delay: float = 3.0,
         reconnect_jitter: float = 0.10,
         reconnect_log_interval: float = 2.0,
+        raw_frame_store: Optional[RenderedFrame] = None,
     ):
         self.src = src
         self.use_opencv = bool(use_opencv)
@@ -2039,6 +2040,7 @@ class AdaptiveQueueStream:
             src_use = f"{src_use}{sep}rtsp_transport={self.rtsp_transport}"
         self.src_use = src_use
         self.q: queue.Queue = queue.Queue(maxsize=self.queue_size)
+        self.raw_frame_store = raw_frame_store
         self.stop_flag = threading.Event()
         self.dropped = 0
         self.read_dropped = 0
@@ -2200,6 +2202,23 @@ class AdaptiveQueueStream:
             self._next_reconnect_mono = time.monotonic() + delay
             self._log(f"[SRC] reconnect failed: {self.src} (reason={reason}, failures={self._reconnect_failures}, next_retry={delay:.2f}s)")
 
+    def _publish_raw_frame(self, frame: np.ndarray, ts: float) -> None:
+        store = getattr(self, "raw_frame_store", None)
+        if store is None or frame is None or getattr(frame, "size", 0) == 0:
+            return
+        try:
+            meta = {
+                "capture_ts": float(ts or time.time()),
+                "source_size": [int(frame.shape[1]), int(frame.shape[0])],
+                "frame_size": [int(frame.shape[1]), int(frame.shape[0])],
+                "frame_width": int(frame.shape[1]),
+                "frame_height": int(frame.shape[0]),
+                "raw_only": True,
+            }
+            store.set(frame, meta=meta)
+        except Exception:
+            return
+
     def _loop(self):
         while not self.stop_flag.is_set():
             if not self._connected or self.cap is None:
@@ -2217,7 +2236,9 @@ class AdaptiveQueueStream:
             now_mono = time.monotonic()
             if ok and frame is not None and getattr(frame, "size", 0) != 0:
                 self._last_frame_mono = now_mono
-                item = (frame, time.time())
+                ts_frame = time.time()
+                self._publish_raw_frame(frame, ts_frame)
+                item = (frame, ts_frame)
                 try:
                     self.q.put_nowait(item)
                 except queue.Full:
@@ -2249,7 +2270,9 @@ class AdaptiveQueueStream:
             ok, frame = False, None
         if ok and frame is not None and getattr(frame, "size", 0) != 0:
             self._last_frame_mono = time.monotonic()
-            return True, frame, time.time()
+            ts_frame = time.time()
+            self._publish_raw_frame(frame, ts_frame)
+            return True, frame, ts_frame
         with self._cap_lock:
             old_cap = self.cap
             self.cap = None
@@ -4532,7 +4555,8 @@ def process_one_frame(
         event_sim = float(it.face_sim if is_known else it.low_face_sim)
         events.append((int(it.tid), x1, y1, x2, y2,
                     str(it.name), float(event_sim),
-                    int(it.member_id), int(1 if is_known else 0)))
+                    int(it.member_id), int(1 if is_known else 0),
+                    int(getattr(it, "raw_tid", it.tid))))
 
     cleanup_frames = max(30, int(getattr(args, "max_age", 15)) + int(getattr(args, "iou_max_miss", 5)) + 10)
     for tid in list(identity_state.keys()):
@@ -4572,6 +4596,7 @@ def processor_thread(
     embed_updater: Optional[EmbeddingDBUpdater],
     debug: bool = False,
     save_writer: Optional['SegmentedVideoWriter'] = None,
+    raw_render_store: Optional[RenderedFrame] = None,
 ):
     frame_idx = 0
     identity_state: dict[int, dict] = {}
@@ -4602,6 +4627,26 @@ def processor_thread(
                 frame, ts_cap = frame2, ts2
                 age_ms = (time.time() - float(ts_cap)) * 1000.0
                 dropped_here += 1
+        # Publish the latest decoded clean frame immediately. The playback WebRTC
+        # publisher can use this raw buffer in hybrid mode to keep motion smooth
+        # while AI detection runs at its own FPS. Detection boxes from the
+        # processed buffer are overlaid on this raw stream.
+        if raw_render_store is not None:
+            try:
+                raw_meta = {
+                    "capture_ts": float(ts_cap or time.time()),
+                    "source_size": [int(frame.shape[1]), int(frame.shape[0])],
+                    "frame_size": [int(frame.shape[1]), int(frame.shape[0])],
+                    "frame_width": int(frame.shape[1]),
+                    "frame_height": int(frame.shape[0]),
+                    "sid": int(sid),
+                    "camera_db_id": int(camera_db_id),
+                    "raw_only": True,
+                }
+                raw_render_store.set(frame, meta=raw_meta)
+            except Exception:
+                pass
+
         try:
             gallery_mgr.maybe_reload(args)
             people_by_cam, face_gallery, name_to_mid = gallery_mgr.snapshot()
@@ -4637,7 +4682,24 @@ def processor_thread(
                     cv2.putText(out, ln, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                     y += 22
             frame_meta = dict(meta or {})
-            frame_meta.update({"fps": float(fps_ema), "sid": int(sid), "camera_db_id": int(camera_db_id), "frame_idx": int(frame_idx)})
+            try:
+                frame_h, frame_w = out.shape[:2]
+            except Exception:
+                frame_h, frame_w = frame.shape[:2]
+            frame_meta.update({
+                "fps": float(fps_ema),
+                "ai_fps": float(fps_ema),
+                "sid": int(sid),
+                "camera_db_id": int(camera_db_id),
+                "frame_idx": int(frame_idx),
+                "capture_ts": float(ts_cap or time.time()),
+                "processed_size": [int(frame_w), int(frame_h)],
+                "frame_size": [int(frame_w), int(frame_h)],
+                "frame_width": int(frame_w),
+                "frame_height": int(frame_h),
+                "source_size": [int(frame.shape[1]), int(frame.shape[0])],
+                "playback_hybrid_ready": True,
+            })
             render_store.set(out, meta=frame_meta)
             if save_writer is not None:
                 try:
@@ -5243,6 +5305,7 @@ def processor_thread_with_stop(
     stop_evt: threading.Event,
     debug: bool = False,
     save_writer: Optional[SegmentedVideoWriter] = None,
+    raw_render_store: Optional[RenderedFrame] = None,
 ):
     frame_idx = 0
     identity_state: dict[int, dict] = {}
@@ -5273,6 +5336,26 @@ def processor_thread_with_stop(
                 frame, ts_cap = frame2, ts2
                 age_ms = (time.time() - float(ts_cap)) * 1000.0
                 dropped_here += 1
+        # Publish the latest decoded clean frame immediately. The playback WebRTC
+        # publisher can use this raw buffer in hybrid mode to keep motion smooth
+        # while AI detection runs at its own FPS. Detection boxes from the
+        # processed buffer are overlaid on this raw stream.
+        if raw_render_store is not None:
+            try:
+                raw_meta = {
+                    "capture_ts": float(ts_cap or time.time()),
+                    "source_size": [int(frame.shape[1]), int(frame.shape[0])],
+                    "frame_size": [int(frame.shape[1]), int(frame.shape[0])],
+                    "frame_width": int(frame.shape[1]),
+                    "frame_height": int(frame.shape[0]),
+                    "sid": int(sid),
+                    "camera_db_id": int(camera_db_id),
+                    "raw_only": True,
+                }
+                raw_render_store.set(frame, meta=raw_meta)
+            except Exception:
+                pass
+
         try:
             gallery_mgr.maybe_reload(args)
             people_by_cam, face_gallery, name_to_mid = gallery_mgr.snapshot()
@@ -5308,7 +5391,24 @@ def processor_thread_with_stop(
                     cv2.putText(out, ln, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                     y += 22
             frame_meta = dict(meta or {})
-            frame_meta.update({"fps": float(fps_ema), "sid": int(sid), "camera_db_id": int(camera_db_id), "frame_idx": int(frame_idx)})
+            try:
+                frame_h, frame_w = out.shape[:2]
+            except Exception:
+                frame_h, frame_w = frame.shape[:2]
+            frame_meta.update({
+                "fps": float(fps_ema),
+                "ai_fps": float(fps_ema),
+                "sid": int(sid),
+                "camera_db_id": int(camera_db_id),
+                "frame_idx": int(frame_idx),
+                "capture_ts": float(ts_cap or time.time()),
+                "processed_size": [int(frame_w), int(frame_h)],
+                "frame_size": [int(frame_w), int(frame_h)],
+                "frame_width": int(frame_w),
+                "frame_height": int(frame_h),
+                "source_size": [int(frame.shape[1]), int(frame.shape[0])],
+                "playback_hybrid_ready": True,
+            })
             render_store.set(out, meta=frame_meta)
             if save_writer is not None:
                 try:
@@ -5393,6 +5493,7 @@ class TrackingRunner:
         self._threads: List[threading.Thread] = []
         self._streams: List[Dict[str, Any]] = []
         self._render_by_cam: Dict[int, RenderedFrame] = {}
+        self._raw_render_by_cam: Dict[int, RenderedFrame] = {}
         self._gallery_mgr: Optional[GalleryManager] = None
         self._global_owner: Optional[GlobalNameOwner] = None
         self._report = None
@@ -5534,15 +5635,17 @@ class TrackingRunner:
 
         self._streams = []
         self._render_by_cam = {}
+        self._raw_render_by_cam = {}
         for sid, raw_src in enumerate(args.src):
             src = raw_src.strip() if isinstance(raw_src, str) else raw_src
             camera_db_id = int(args.camera_ids[sid])
+            raw_buf = RenderedFrame()
             vs = AdaptiveQueueStream(
                 src, queue_size=args.queue_size, rtsp_transport=args.rtsp_transport, use_opencv=True,
                 freeze_seconds=float(args.stream_freeze_seconds), open_timeout_ms=int(args.stream_open_timeout_ms),
                 read_timeout_ms=int(args.stream_read_timeout_ms), reconnect_base_delay=float(args.stream_reconnect_base_seconds),
                 reconnect_max_delay=float(args.stream_reconnect_max_seconds), reconnect_jitter=float(args.stream_reconnect_jitter),
-                reconnect_log_interval=float(args.stream_reconnect_log_interval),
+                reconnect_log_interval=float(args.stream_reconnect_log_interval), raw_frame_store=raw_buf,
             )
             deep_tracker = None
             if tracker_backend == 'deepsort':
@@ -5579,7 +5682,8 @@ class TrackingRunner:
             iou_tracker = IOUTracker(max_miss=max(1, int(args.iou_max_miss)), iou_thresh=float(getattr(args, 'max_iou_distance', 0.30)))
             buf = RenderedFrame()
             self._render_by_cam[int(camera_db_id)] = buf
-            self._streams.append({"sid": sid, "camera_db_id": camera_db_id, "src": raw_src, "vs": vs, "deep": deep_tracker, "iou": iou_tracker, "buf": buf})
+            self._raw_render_by_cam[int(camera_db_id)] = raw_buf
+            self._streams.append({"sid": sid, "camera_db_id": camera_db_id, "src": raw_src, "vs": vs, "deep": deep_tracker, "iou": iou_tracker, "buf": buf, "raw_buf": raw_buf})
         opened_now = any(s["vs"].is_opened() for s in self._streams)
         all_file_sources = bool(self._streams) and all(bool(getattr(s["vs"], "is_file_source", False)) for s in self._streams)
         if (not opened_now) and all_file_sources:
@@ -5615,6 +5719,7 @@ class TrackingRunner:
                 args=(int(s["sid"]), int(s["camera_db_id"]), s["vs"], s["buf"], self._yolo, args, s["deep"], s["iou"],
                       self._gallery_mgr, self._reid_extractor, self._face_app, self._global_owner, self._report,
                       self._normalized_report, self._embed_updater, self._stop_evt, False),
+                kwargs={"raw_render_store": s.get("raw_buf")},
                 daemon=True,
             )
             t.start()
@@ -5699,6 +5804,9 @@ class TrackingRunner:
     def get_camera_buffer(self, cam_id: int) -> Optional[RenderedFrame]:
         return self._render_by_cam.get(int(cam_id))
 
+    def get_camera_raw_buffer(self, cam_id: int) -> Optional[RenderedFrame]:
+        return self._raw_render_by_cam.get(int(cam_id))
+
     def list_db_cameras(self, active_only: bool = True) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         for s in self._streams:
@@ -5718,6 +5826,7 @@ class TrackingRunner:
             "running": bool(self._started),
             "camera_ids": cams,
             "num_cameras": len(cams),
+            "raw_camera_ids": sorted(list(self._raw_render_by_cam.keys())),
             "save_csv": bool(getattr(self.args, "save_csv", False)),
             "csv_path": str(getattr(self.args, "csv", "") or ""),
             "write_normalized_data": bool(self._normalized_data_writer is not None),
@@ -6578,7 +6687,8 @@ def process_one_frame(
             int(it.tid), x1, y1, x2, y2,
             str(it.name), float(event_sim),
             int(it.member_id),
-            int(1 if is_known else 0)
+            int(1 if is_known else 0),
+            int(getattr(it, "raw_tid", it.tid))
         ))
     if known_reattach_mgr is not None:
         snaps: List[Dict[str, Any]] = []

@@ -140,15 +140,15 @@ class Settings(BaseSettings):
     # Playback tracing stability settings.
     # Playback is on-demand and can run while the 12-camera live pipeline is already using CUDA.
     # Keep playback CPU-safe by default to avoid cross-framework CUDA/cudNN crashes.
-    PLAYBACK_DEVICE: str = "cpu"
+    PLAYBACK_DEVICE: str = "cuda:0"
     PLAYBACK_YOLO_WEIGHTS: str = "yolov8n.pt"
-    PLAYBACK_YOLO_IMGSZ: int = 640
+    PLAYBACK_YOLO_IMGSZ: int = 512
     PLAYBACK_CONF: float = 0.30
     PLAYBACK_IOU: float = 0.45
-    PLAYBACK_HALF: bool = False
-    PLAYBACK_CUDNN_BENCHMARK: bool = False
+    PLAYBACK_HALF: bool = True
+    PLAYBACK_CUDNN_BENCHMARK: bool = True
     PLAYBACK_TRACKER_BACKEND: str = "iou"  # iou, bytetrack, deepsort, strongsort
-    PLAYBACK_USE_FACE: bool = True
+    PLAYBACK_USE_FACE: bool = False
     PLAYBACK_FACE_PROVIDER: str = "cpu"  # cpu is safest while live CUDA pipeline is running
     PLAYBACK_FACE_DET_SIZE: str = "640 640"
     PLAYBACK_FACE_EVERY_N: int = 5
@@ -159,9 +159,9 @@ class Settings(BaseSettings):
     # decoded frames here does not break HEVC/H264 reference chains.
     PLAYBACK_REALTIME_MODE: bool = True
     PLAYBACK_KEEP_ALL_FRAMES: bool = False
-    PLAYBACK_QUEUE_SIZE: int = 24
-    PLAYBACK_MAX_QUEUE_AGE_MS: int = 1200
-    PLAYBACK_MAX_DRAIN_PER_CYCLE: int = 64
+    PLAYBACK_QUEUE_SIZE: int = 8
+    PLAYBACK_MAX_QUEUE_AGE_MS: int = 600
+    PLAYBACK_MAX_DRAIN_PER_CYCLE: int = 128
     PLAYBACK_STREAM_FREEZE_SECONDS: float = 300.0
     PLAYBACK_STREAM_OPEN_TIMEOUT_MS: int = 8000
     PLAYBACK_STREAM_READ_TIMEOUT_MS: int = 8000
@@ -171,16 +171,17 @@ class Settings(BaseSettings):
     PLAYBACK_HOLD_LAST_FRAME: bool = True
     PLAYBACK_PLACEHOLDER_BEFORE_FIRST_FRAME_ONLY: bool = True
     PLAYBACK_BOOTSTRAP_PLACEHOLDER: bool = True
+    PLAYBACK_WEBRTC_MODE: str = "hybrid"
     PLAYBACK_WEBRTC_WIDTH: int = 1280
     PLAYBACK_WEBRTC_HEIGHT: int = 720
-    PLAYBACK_WEBRTC_FPS: float = 15.0
-    PLAYBACK_VIDEO_FPS: float = 15.0
-    PLAYBACK_WEBRTC_GOP: int = 30
-    PLAYBACK_WEBRTC_CODEC: str = "libx264"
-    PLAYBACK_WEBRTC_BITRATE: str = "5000k"
-    PLAYBACK_WEBRTC_BUFSIZE: str = "10000k"
+    PLAYBACK_WEBRTC_FPS: float = 20.0
+    PLAYBACK_VIDEO_FPS: float = 20.0
+    PLAYBACK_WEBRTC_GOP: int = 40
+    PLAYBACK_WEBRTC_CODEC: str = "auto"
+    PLAYBACK_WEBRTC_BITRATE: str = "6000k"
+    PLAYBACK_WEBRTC_BUFSIZE: str = "12000k"
     PLAYBACK_WEBRTC_PRESET: str = "ultrafast"
-    PLAYBACK_WEBRTC_OVERLAY_MAX_AGE_MS: int = 5000
+    PLAYBACK_WEBRTC_OVERLAY_MAX_AGE_MS: int = 2500
 
     # CP Plus playback clean restream stage. This is intentionally separate from
     # the live NVDEC restream: CP Plus H265 playback can start mid-GOP and is
@@ -193,12 +194,12 @@ class Settings(BaseSettings):
     PLAYBACK_CLEAN_RESTREAM_ENCODER: str = "libx264"
     PLAYBACK_CLEAN_RESTREAM_WIDTH: int = 1280
     PLAYBACK_CLEAN_RESTREAM_HEIGHT: int = 720
-    PLAYBACK_CLEAN_RESTREAM_FPS: float = 15.0
-    PLAYBACK_CLEAN_RESTREAM_BITRATE: str = "5000k"
-    PLAYBACK_CLEAN_RESTREAM_BUFSIZE: str = "10000k"
-    PLAYBACK_CLEAN_RESTREAM_GOP: int = 30
+    PLAYBACK_CLEAN_RESTREAM_FPS: float = 20.0
+    PLAYBACK_CLEAN_RESTREAM_BITRATE: str = "6000k"
+    PLAYBACK_CLEAN_RESTREAM_BUFSIZE: str = "12000k"
+    PLAYBACK_CLEAN_RESTREAM_GOP: int = 40
     PLAYBACK_CLEAN_RESTREAM_ALL_I: bool = False
-    PLAYBACK_CLEAN_RESTREAM_PRESET: str = "veryfast"
+    PLAYBACK_CLEAN_RESTREAM_PRESET: str = "ultrafast"
     PLAYBACK_CLEAN_RESTREAM_RTSP_TRANSPORT: str = "tcp"
     PLAYBACK_CLEAN_RESTREAM_LOG_DIR: str = "logs/playback_clean_restream"
     PLAYBACK_CLEAN_RESTREAM_PATH_PREFIX: str = "playback_clean_"
@@ -208,8 +209,9 @@ class Settings(BaseSettings):
     # Optional playback overlay tuning used by patched pipeline_tracing draw paths.
     PLAYBACK_OVERLAY_FONT_SCALE: float = 0.45
     PLAYBACK_OVERLAY_THICKNESS: int = 1
-    PLAYBACK_OVERLAY_LABEL_MAX_CHARS: int = 14
-    PLAYBACK_SHOW_UNKNOWN_LABELS: bool = False
+    PLAYBACK_OVERLAY_LABEL_MAX_CHARS: int = 24
+    PLAYBACK_SHOW_TRACK_ID: bool = True
+    PLAYBACK_SHOW_UNKNOWN_LABELS: bool = True
 
     # Camera channel map, e.g. "11:101,12:301,10:201,9:401"
     CHANNEL_MAP: str = ""

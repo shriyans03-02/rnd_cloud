@@ -1344,7 +1344,9 @@ class PlaybackTracingService:
         args.csv = ""
         args.no_save_video = True
         args.show = False
-        args.overlay_fps = False
+        # For playback debugging/QA the FPS overlay is useful and cheap.
+        # It can still be disabled with PLAYBACK_OVERLAY_FPS=False.
+        args.overlay_fps = self._env_bool("PLAYBACK_OVERLAY_FPS", True)
         args.write_normalized_data = False
         args.update_db_embeddings = False
         args.gallery_request_mode = str(request_mode or "location")
@@ -1376,6 +1378,10 @@ class PlaybackTracingService:
             pass
         try:
             args.draw_only_matched = False
+        except Exception:
+            pass
+        try:
+            args.no_show_track_id = False
         except Exception:
             pass
         try:

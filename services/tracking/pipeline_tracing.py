@@ -24,6 +24,7 @@ import argparse
 import csv
 import ctypes
 import gzip
+import contextlib
 import math
 import os
 import random
@@ -1877,8 +1878,23 @@ def init_face_engine(use_face: bool, device: str, face_model: str, det_w: int, d
         return None
 
 
+def _env_bool_local(name: str, default: bool = False) -> bool:
+    try:
+        v = str(os.environ.get(name, "")).strip().lower()
+        if not v:
+            return bool(default)
+        return v in {"1", "true", "yes", "on", "y"}
+    except Exception:
+        return bool(default)
+
+
 def _yolo_forward_safe(yolo, frame, args):
-    with _yolo_lock, torch.inference_mode():
+    # Playback tracing is already single-session by design.  A global YOLO lock
+    # makes the playback detector wait behind the live multi-camera pipeline when
+    # both happen to import this module, which looks like slow-motion playback.
+    # Keep the lock opt-in for debugging only.
+    lock_ctx = _yolo_lock if _env_bool_local("PLAYBACK_YOLO_LOCK", False) else contextlib.nullcontext()
+    with lock_ctx, torch.inference_mode():
         try:
             return yolo(frame, conf=args.conf, iou=args.iou, verbose=False, device=args.device, half=args.half,
                         imgsz=int(args.yolo_imgsz) if int(args.yolo_imgsz) > 0 else None)
@@ -4482,13 +4498,13 @@ def process_one_frame(
             color = (0, 255, 0)
             if it.face_hit and float(it.face_sim) < 0.50:
                 color = (0, 0, 255)
-            label_txt = f"{it.name}"
+            label_txt = f"{it.name} (T{int(it.tid)})"
         else:
             if bool(it.low_face) and float(it.low_face_sim) > 0:
                 color = (0, 0, 255)
             else:
                 color = (0, 255, 255)
-            show_unknown_labels = str(os.environ.get("PLAYBACK_SHOW_UNKNOWN_LABELS", "false")).strip().lower() in {"1", "true", "yes", "on", "y"}
+            show_unknown_labels = str(os.environ.get("PLAYBACK_SHOW_UNKNOWN_LABELS", "true")).strip().lower() in {"1", "true", "yes", "on", "y"}
             label_txt = "Unknown" if show_unknown_labels else ""
 
         try:
@@ -4500,7 +4516,7 @@ def process_one_frame(
         except Exception:
             thickness = 1
         try:
-            max_chars = max(0, int(os.environ.get("PLAYBACK_OVERLAY_LABEL_MAX_CHARS", "14") or 14))
+            max_chars = max(0, int(os.environ.get("PLAYBACK_OVERLAY_LABEL_MAX_CHARS", "32") or 14))
         except Exception:
             max_chars = 14
         if max_chars > 0 and len(label_txt) > max_chars:
@@ -6523,7 +6539,7 @@ def process_one_frame(
             )
         else:
             color = (0, 255, 255)
-            show_unknown_labels = str(os.environ.get("PLAYBACK_SHOW_UNKNOWN_LABELS", "false")).strip().lower() in {"1", "true", "yes", "on", "y"}
+            show_unknown_labels = str(os.environ.get("PLAYBACK_SHOW_UNKNOWN_LABELS", "true")).strip().lower() in {"1", "true", "yes", "on", "y"}
             label_txt = f"Unknown (T{show_raw_tid})" if show_unknown_labels else ""
 
         try:
@@ -6535,7 +6551,7 @@ def process_one_frame(
         except Exception:
             thickness = 1
         try:
-            max_chars = max(0, int(os.environ.get("PLAYBACK_OVERLAY_LABEL_MAX_CHARS", "14") or 14))
+            max_chars = max(0, int(os.environ.get("PLAYBACK_OVERLAY_LABEL_MAX_CHARS", "32") or 14))
         except Exception:
             max_chars = 14
         if max_chars > 0 and len(label_txt) > max_chars:

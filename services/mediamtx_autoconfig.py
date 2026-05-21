@@ -183,6 +183,8 @@ def build_mediamtx_config(cameras: List[Dict[str, Any]]) -> str:
     lines.append("    source: publisher")
     lines.append("  '~^playback_cam[0-9]+$':")
     lines.append("    source: publisher")
+    lines.append("  '~^playback_clean_.*$':")
+    lines.append("    source: publisher")
     lines.append("  '~^playback_trace_.*$':")
     lines.append("    source: publisher")
     lines.append("  all_others:")

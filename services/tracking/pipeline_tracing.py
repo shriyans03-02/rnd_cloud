@@ -4488,11 +4488,28 @@ def process_one_frame(
                 color = (0, 0, 255)
             else:
                 color = (0, 255, 255)
-            label_txt = "Unknown"
+            show_unknown_labels = str(os.environ.get("PLAYBACK_SHOW_UNKNOWN_LABELS", "false")).strip().lower() in {"1", "true", "yes", "on", "y"}
+            label_txt = "Unknown" if show_unknown_labels else ""
 
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(out, label_txt, (x1, max(0, y1 - 7)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 2, color, 4)
+        try:
+            font_scale = float(os.environ.get("PLAYBACK_OVERLAY_FONT_SCALE", "0.45") or 0.45)
+        except Exception:
+            font_scale = 0.45
+        try:
+            thickness = max(1, int(os.environ.get("PLAYBACK_OVERLAY_THICKNESS", "1") or 1))
+        except Exception:
+            thickness = 1
+        try:
+            max_chars = max(0, int(os.environ.get("PLAYBACK_OVERLAY_LABEL_MAX_CHARS", "14") or 14))
+        except Exception:
+            max_chars = 14
+        if max_chars > 0 and len(label_txt) > max_chars:
+            label_txt = label_txt[:max_chars]
+
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness)
+        if label_txt:
+            cv2.putText(out, label_txt, (x1, max(0, y1 - 7)),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
 
         shown += 1
 
@@ -6506,19 +6523,36 @@ def process_one_frame(
             )
         else:
             color = (0, 255, 255)
-            label_txt = f"Unknown (T{show_raw_tid})"
+            show_unknown_labels = str(os.environ.get("PLAYBACK_SHOW_UNKNOWN_LABELS", "false")).strip().lower() in {"1", "true", "yes", "on", "y"}
+            label_txt = f"Unknown (T{show_raw_tid})" if show_unknown_labels else ""
 
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        try:
+            font_scale = float(os.environ.get("PLAYBACK_OVERLAY_FONT_SCALE", "0.45") or 0.45)
+        except Exception:
+            font_scale = 0.45
+        try:
+            thickness = max(1, int(os.environ.get("PLAYBACK_OVERLAY_THICKNESS", "1") or 1))
+        except Exception:
+            thickness = 1
+        try:
+            max_chars = max(0, int(os.environ.get("PLAYBACK_OVERLAY_LABEL_MAX_CHARS", "14") or 14))
+        except Exception:
+            max_chars = 14
+        if max_chars > 0 and len(label_txt) > max_chars:
+            label_txt = label_txt[:max_chars]
 
-        cv2.putText(
-            out,
-            label_txt,
-            (x1, max(0, y1 - 7)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            2,
-            color,
-            4
-        )
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness)
+
+        if label_txt:
+            cv2.putText(
+                out,
+                label_txt,
+                (x1, max(0, y1 - 7)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                color,
+                thickness
+            )
 
         shown += 1
 

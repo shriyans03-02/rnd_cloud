@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import os
+import shlex
 import subprocess
 import threading
 import time
@@ -779,6 +780,317 @@ class AnnotatedRtspPublisher:
         }
 
 
+def _redact_rtsp_url(url: str) -> str:
+    text = str(url or "")
+    try:
+        if "://" not in text or "@" not in text:
+            return text
+        scheme, rest = text.split("://", 1)
+        userinfo, tail = rest.split("@", 1)
+        if ":" in userinfo:
+            user = userinfo.split(":", 1)[0]
+            return f"{scheme}://{user}:***@{tail}"
+        return f"{scheme}://***@{tail}"
+    except Exception:
+        return text
+
+
+def _setting_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(str(name))
+    if raw is not None:
+        return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+    try:
+        return bool(getattr(settings, str(name), default))
+    except Exception:
+        return bool(default)
+
+
+def _setting_str(name: str, default: str = "") -> str:
+    raw = os.environ.get(str(name))
+    if raw is not None:
+        return str(raw)
+    try:
+        value = getattr(settings, str(name), default)
+    except Exception:
+        value = default
+    return str(default if value is None else value)
+
+
+def _setting_int(name: str, default: int) -> int:
+    raw = os.environ.get(str(name))
+    if raw is None:
+        try:
+            raw = getattr(settings, str(name), default)
+        except Exception:
+            raw = default
+    try:
+        return int(raw)
+    except Exception:
+        return int(default)
+
+
+def _setting_float(name: str, default: float) -> float:
+    raw = os.environ.get(str(name))
+    if raw is None:
+        try:
+            raw = getattr(settings, str(name), default)
+        except Exception:
+            raw = default
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+def _split_ffmpeg_flags(value: str) -> list[str]:
+    try:
+        return shlex.split(str(value or ""))
+    except Exception:
+        # Do not let a malformed optional flags env break playback completely.
+        return []
+
+
+class PlaybackCleanRestream:
+    """
+    CP Plus playback clean-up stage.
+
+    The NVR records H265/HEVC. VLC can display it because it has a tolerant,
+    buffered decoder. OpenCV/AI reading the NVR RTSP directly can drop HEVC
+    reference frames and then produces artifacts such as:
+
+        Could not find ref with POC ...
+        Error constructing the frame RPS
+
+    This class starts FFmpeg as a dedicated buffered decoder/transcoder:
+
+        CP Plus H265 playback RTSP
+          -> FFmpeg software HEVC decode
+          -> stable local H264 all-I RTSP
+          -> MediaMTX playback_clean_*
+          -> pipeline_tracing/OpenCV
+
+    The clean RTSP path is local, so all-I H264 is acceptable and avoids long
+    dependency chains before the AI pipeline receives frames.
+    """
+
+    def __init__(
+        self,
+        *,
+        raw_rtsp_source: str,
+        stream_name: str,
+        ffmpeg_bin: str,
+        mediamtx_rtsp_base: str,
+    ):
+        self.raw_rtsp_source = str(raw_rtsp_source or "")
+        self.stream_name = str(stream_name or "").strip().strip("/")
+        self.ffmpeg_bin = str(ffmpeg_bin or "ffmpeg")
+        self.mediamtx_rtsp_base = str(mediamtx_rtsp_base or "").rstrip("/")
+        self.rtsp_output = f"{self.mediamtx_rtsp_base}/{self.stream_name}"
+        self._proc: Optional[subprocess.Popen] = None
+        self._stderr_handle = None
+        self._started_at: float = 0.0
+        self._error: str = ""
+        log_dir = _setting_str("PLAYBACK_CLEAN_RESTREAM_LOG_DIR", "logs/playback_clean_restream") or "logs/playback_clean_restream"
+        os.makedirs(log_dir, exist_ok=True)
+        safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in self.stream_name)
+        self.log_path = os.path.join(log_dir, f"{safe_name or 'playback_clean'}.log")
+
+    @staticmethod
+    def enabled() -> bool:
+        return _setting_bool("PLAYBACK_CLEAN_RESTREAM_ENABLED", True)
+
+    @staticmethod
+    def make_stream_name(camera_id: int, request_mode: str, token: Optional[str] = None) -> str:
+        prefix = _setting_str("PLAYBACK_CLEAN_RESTREAM_PATH_PREFIX", "playback_clean_") or "playback_clean_"
+        prefix = prefix.strip().strip("/")
+        if not prefix:
+            prefix = "playback_clean_"
+        if not prefix.endswith("_") and not prefix.endswith("/"):
+            prefix += "_"
+        suffix = str(token or uuid.uuid4().hex[:12])
+        mode = str(request_mode or "location").strip().lower() or "location"
+        return f"{prefix}{mode}_cam{int(camera_id)}_{suffix}".strip("/")
+
+    def _build_cmd(self) -> list[str]:
+        rtsp_transport = _setting_str("PLAYBACK_CLEAN_RESTREAM_RTSP_TRANSPORT", "tcp") or "tcp"
+        decoder = _setting_str("PLAYBACK_CLEAN_RESTREAM_DECODER", "hevc").strip()
+        encoder = _setting_str("PLAYBACK_CLEAN_RESTREAM_ENCODER", "libx264").strip() or "libx264"
+        width = max(0, _setting_int("PLAYBACK_CLEAN_RESTREAM_WIDTH", 1280))
+        height = max(0, _setting_int("PLAYBACK_CLEAN_RESTREAM_HEIGHT", 720))
+        fps = max(1.0, _setting_float("PLAYBACK_CLEAN_RESTREAM_FPS", 8.0))
+        bitrate = _setting_str("PLAYBACK_CLEAN_RESTREAM_BITRATE", "8000k") or "4000k"
+        bufsize = _setting_str("PLAYBACK_CLEAN_RESTREAM_BUFSIZE", "16000k") or "8000k"
+        gop = max(1, _setting_int("PLAYBACK_CLEAN_RESTREAM_GOP", 16))
+        all_i = _setting_bool("PLAYBACK_CLEAN_RESTREAM_ALL_I", True)
+        preset = _setting_str("PLAYBACK_CLEAN_RESTREAM_PRESET", "veryfast") or "veryfast"
+
+        cmd: list[str] = [self.ffmpeg_bin, "-hide_banner", "-loglevel", "warning"]
+        cmd += ["-rtsp_transport", rtsp_transport]
+        cmd += _split_ffmpeg_flags(
+            _setting_str(
+                "PLAYBACK_CLEAN_RESTREAM_FFMPEG_FLAGS",
+                "-fflags +genpts+discardcorrupt -err_detect ignore_err -analyzeduration 10000000 -probesize 10000000 -max_delay 5000000",
+            )
+        )
+
+        # Force the software decoder by default. Do not use hevc_cuvid for CP Plus
+        # playback unless explicitly configured; the GPU decoder tends to expose
+        # the broken reference frames as large visual block corruption.
+        if decoder and decoder.lower() not in {"auto", "none", "default"}:
+            if decoder.lower() in {"hevc_cuvid", "h264_cuvid"}:
+                cmd += ["-hwaccel", "cuda", "-c:v", decoder]
+            else:
+                cmd += ["-c:v", decoder]
+
+        cmd += ["-i", self.raw_rtsp_source, "-map", "0:v:0", "-an"]
+
+        vf_parts: list[str] = [f"fps={fps:g}"]
+        if width > 0 and height > 0:
+            # Ensure even dimensions for yuv420p/H264.
+            width -= width % 2
+            height -= height % 2
+            vf_parts.append(f"scale={width}:{height}:flags=bicubic")
+        cmd += ["-vf", ",".join(vf_parts)]
+
+        cmd += ["-c:v", encoder]
+        enc_lower = encoder.lower()
+        if enc_lower in {"libx264", "h264"}:
+            cmd += [
+                "-preset", preset,
+                "-tune", "zerolatency",
+                "-pix_fmt", "yuv420p",
+                "-b:v", bitrate,
+                "-maxrate", bitrate,
+                "-bufsize", bufsize,
+                "-sc_threshold", "0",
+                "-bf", "0",
+            ]
+            if all_i:
+                cmd += ["-g", "1", "-keyint_min", "1", "-x264-params", "keyint=1:min-keyint=1:scenecut=0"]
+            else:
+                cmd += ["-g", str(gop), "-keyint_min", str(gop)]
+        elif enc_lower in {"h264_nvenc", "hevc_nvenc"}:
+            cmd += [
+                "-preset", "p1" if preset == "ultrafast" else preset,
+                "-tune", "ll",
+                "-pix_fmt", "yuv420p",
+                "-b:v", bitrate,
+                "-maxrate", bitrate,
+                "-bufsize", bufsize,
+                "-g", "1" if all_i else str(gop),
+                "-bf", "0",
+            ]
+
+        cmd += [
+            "-muxdelay", "0",
+            "-muxpreload", "0",
+            "-f", "rtsp",
+            "-rtsp_transport", "tcp",
+            self.rtsp_output,
+        ]
+        return cmd
+
+    def _tail_log(self, max_chars: int = 4000) -> str:
+        try:
+            with open(self.log_path, "r", encoding="utf-8", errors="replace") as fh:
+                return fh.read()[-max_chars:]
+        except Exception:
+            return ""
+
+    def start(self) -> None:
+        if self._proc is not None and self._proc.poll() is None:
+            return
+        if not self.raw_rtsp_source:
+            raise RuntimeError("raw CP Plus playback RTSP source is empty")
+        if not self.mediamtx_rtsp_base:
+            raise RuntimeError("MEDIAMTX_RTSP is required for playback clean restream")
+
+        self._stderr_handle = open(self.log_path, "a", buffering=1)
+        cmd = self._build_cmd()
+        # Log a redacted command for debugging without exposing the NVR password.
+        try:
+            redacted = [(_redact_rtsp_url(x) if str(x).startswith("rtsp://") else x) for x in cmd]
+            self._stderr_handle.write("\n[playback-clean] command: " + " ".join(shlex.quote(str(x)) for x in redacted) + "\n")
+        except Exception:
+            pass
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=self._stderr_handle,
+                close_fds=True,
+            )
+            self._started_at = time.time()
+        except Exception as exc:
+            self._error = f"could not start playback clean restream: {exc}"
+            try:
+                if self._stderr_handle is not None:
+                    self._stderr_handle.close()
+            except Exception:
+                pass
+            self._stderr_handle = None
+            raise
+
+    def wait_until_ready(self, timeout: Optional[float] = None) -> bool:
+        # MediaMTX does not need an explicit API call here: once FFmpeg publishes
+        # to playback_clean_*, the AI runner can open that local RTSP path. We
+        # just give FFmpeg a short warmup and fail early if the process exits.
+        if timeout is None:
+            timeout = _setting_float("PLAYBACK_CLEAN_RESTREAM_WARMUP_SECONDS", 2.0)
+        deadline = time.monotonic() + max(0.0, float(timeout or 0.0))
+        while time.monotonic() < deadline:
+            if self._proc is not None and self._proc.poll() is not None:
+                self._error = f"playback clean restream exited early with code {self._proc.returncode}: {self._tail_log(1200)}"
+                return False
+            time.sleep(0.1)
+        return bool(self._proc is not None and self._proc.poll() is None)
+
+    def stop(self) -> None:
+        proc = self._proc
+        self._proc = None
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=3.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        if self._stderr_handle is not None:
+            try:
+                self._stderr_handle.close()
+            except Exception:
+                pass
+            self._stderr_handle = None
+
+    def is_alive(self) -> bool:
+        return bool(self._proc is not None and self._proc.poll() is None)
+
+    def error(self) -> str:
+        if self._error:
+            return str(self._error)
+        if self._proc is not None and self._proc.poll() is not None:
+            return f"playback clean restream exited with code {self._proc.returncode}: {self._tail_log(1200)}"
+        return ""
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "stream_name": self.stream_name,
+            "rtsp_output": self.rtsp_output,
+            "source": _redact_rtsp_url(self.raw_rtsp_source),
+            "pid": int(self._proc.pid) if self._proc is not None and self._proc.pid else None,
+            "alive": self.is_alive(),
+            "started_at": float(self._started_at or 0.0),
+            "log_path": self.log_path,
+            "error": self.error(),
+        }
+
+
 @dataclass
 class PlaybackTraceSession:
     session_id: str
@@ -787,6 +1099,10 @@ class PlaybackTraceSession:
     request_mode: str
     member_id: Optional[int]
     member_name: str
+    # raw_rtsp_source is the original CP Plus H265 playback URL from the NVR.
+    # rtsp_source is the stream actually consumed by pipeline_tracing; when the
+    # clean restream is enabled this becomes rtsp://127.0.0.1:8554/playback_clean_*.
+    raw_rtsp_source: str
     rtsp_source: str
     start_time: str
     end_time: str
@@ -795,6 +1111,7 @@ class PlaybackTraceSession:
     runner: TrackingRunner
     buffer: Optional[RenderedFrame]
     publisher: Optional[AnnotatedRtspPublisher]
+    clean_restream: Optional[PlaybackCleanRestream]
 
 
 class PlaybackTracingService:
@@ -1147,14 +1464,54 @@ class PlaybackTracingService:
                 for old_session_id in active_session_ids[:overflow]:
                     self.stop_session(old_session_id)
 
+        raw_rtsp_source = str(rtsp_source)
+        pipeline_rtsp_source = raw_rtsp_source
+        clean_restream: Optional[PlaybackCleanRestream] = None
+
+        # Generate the identifiers before starting FFmpeg so the clean path and
+        # processed trace path can be correlated in logs/status.
+        session_id = self._make_session_id(int(camera_id), mode)
+        stream_name = self._make_stream_name(int(camera_id), mode)
+
+        # IMPORTANT CP Plus playback flow:
+        # raw H265 NVR playback -> FFmpeg buffered decode -> H264 all-I local RTSP
+        # playback_clean_* -> OpenCV/AI -> playback_trace_* -> WebRTC.
+        if PlaybackCleanRestream.enabled():
+            clean_stream_name = PlaybackCleanRestream.make_stream_name(int(camera_id), mode)
+            clean_restream = PlaybackCleanRestream(
+                raw_rtsp_source=raw_rtsp_source,
+                stream_name=clean_stream_name,
+                ffmpeg_bin=str(getattr(settings, "FFMPEG_BIN", "ffmpeg") or "ffmpeg"),
+                mediamtx_rtsp_base=str(getattr(settings, "MEDIAMTX_RTSP", "") or ""),
+            )
+            try:
+                clean_restream.start()
+                if not clean_restream.wait_until_ready():
+                    err = clean_restream.error() or "clean restream did not stay alive"
+                    clean_restream.stop()
+                    raise RuntimeError(err)
+                pipeline_rtsp_source = clean_restream.rtsp_output
+                print(
+                    f"[PLAYBACK-CLEAN] camera_id={int(camera_id)} "
+                    f"raw={_redact_rtsp_url(raw_rtsp_source)} -> clean={pipeline_rtsp_source}"
+                )
+            except Exception:
+                try:
+                    clean_restream.stop()
+                except Exception:
+                    pass
+                raise
+
         args = self._build_session_args(
-            rtsp_source=str(rtsp_source),
+            rtsp_source=str(pipeline_rtsp_source),
             camera_id=int(camera_id),
             request_mode=mode,
             member_id=member_id,
             member_name=member_name_clean,
         )
         if not str(getattr(args, "db_url", "") or "").strip():
+            if clean_restream is not None:
+                clean_restream.stop()
             raise RuntimeError("DATABASE_URL / --db-url is required for playback tracing sessions.")
 
         runner = TrackingRunner(args)
@@ -1165,6 +1522,11 @@ class PlaybackTracingService:
                 runner.stop()
             except Exception:
                 pass
+            if clean_restream is not None:
+                try:
+                    clean_restream.stop()
+                except Exception:
+                    pass
             raise
 
         buf = runner.get_camera_buffer(int(camera_id))
@@ -1173,10 +1535,13 @@ class PlaybackTracingService:
                 runner.stop()
             except Exception:
                 pass
+            if clean_restream is not None:
+                try:
+                    clean_restream.stop()
+                except Exception:
+                    pass
             raise RuntimeError(f"Camera buffer not available for camera_id={int(camera_id)}")
 
-        session_id = self._make_session_id(int(camera_id), mode)
-        stream_name = self._make_stream_name(int(camera_id), mode)
         publisher = AnnotatedRtspPublisher(
             buffer=buf,
             runner=runner,
@@ -1192,6 +1557,11 @@ class PlaybackTracingService:
                 runner.stop()
             except Exception:
                 pass
+            if clean_restream is not None:
+                try:
+                    clean_restream.stop()
+                except Exception:
+                    pass
             raise
 
         # Do not block waiting for the first frame. NVR playback can take 30-50s.
@@ -1204,7 +1574,8 @@ class PlaybackTracingService:
             request_mode=str(mode),
             member_id=int(member_id) if member_id is not None else None,
             member_name=str(member_name_clean),
-            rtsp_source=str(rtsp_source),
+            raw_rtsp_source=raw_rtsp_source,
+            rtsp_source=str(pipeline_rtsp_source),
             start_time=str(start_time),
             end_time=str(end_time),
             started_at=float(now),
@@ -1212,6 +1583,7 @@ class PlaybackTracingService:
             runner=runner,
             buffer=buf,
             publisher=publisher,
+            clean_restream=clean_restream,
         )
         with self._lock:
             self._sessions[session_id] = session
@@ -1242,6 +1614,11 @@ class PlaybackTracingService:
             pass
         try:
             session.runner.stop()
+        except Exception:
+            pass
+        try:
+            if session.clean_restream is not None:
+                session.clean_restream.stop()
         except Exception:
             pass
         return True
@@ -1287,6 +1664,10 @@ class PlaybackTracingService:
                 "end_time": str(session.end_time),
                 "started_at": float(session.started_at),
                 "auto_stop_at": float(session.auto_stop_at),
+                "raw_source": _redact_rtsp_url(str(session.raw_rtsp_source)),
+                "pipeline_source": str(session.rtsp_source),
+                "clean_restream_enabled": bool(session.clean_restream is not None),
+                "clean_restream": session.clean_restream.status() if session.clean_restream is not None else None,
                 "hls_url": (
                     f"{str(getattr(settings, 'HLS_BASE_URL', '')).rstrip('/')}/{str(session.stream_name)}/index.m3u8"
                     if session.publisher is not None else ""

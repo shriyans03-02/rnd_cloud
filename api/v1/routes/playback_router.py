@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shlex
 import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
@@ -54,6 +55,34 @@ def _settings_str(name: str, default: str = "") -> str:
     if value is None:
         return str(default)
     return str(value)
+
+
+def _settings_bool(name: str, default: bool) -> bool:
+    raw = _settings_str(name, "")
+    if raw == "":
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _settings_int(name: str, default: int) -> int:
+    try:
+        return int(_settings_str(name, str(default)))
+    except Exception:
+        return int(default)
+
+
+def _settings_float(name: str, default: float) -> float:
+    try:
+        return float(_settings_str(name, str(default)))
+    except Exception:
+        return float(default)
+
+
+def _split_ffmpeg_flags(value: str) -> list[str]:
+    try:
+        return shlex.split(str(value or ""))
+    except Exception:
+        return []
 
 
 # ── CP Plus timestamp helpers ─────────────────────────────────────────────────
@@ -270,17 +299,68 @@ def start_ffmpeg_stream(
     rtsp_source = _build_rtsp_source(int(camera_id), str(start_time), str(end_time))
     rtsp_output = f"{settings.MEDIAMTX_RTSP.rstrip('/')}/{stream_name}"
 
-    cmd = [
-        str(getattr(settings, "FFMPEG_BIN", None) or "ffmpeg"),
-        "-loglevel", "warning",
-        "-rtsp_transport", "tcp",
-        "-fflags", "+nobuffer+discardcorrupt",
-        "-i", rtsp_source,
-        "-c", "copy",
-        "-f", "rtsp",
-        "-rtsp_transport", "tcp",
-        rtsp_output,
-    ]
+    ffmpeg_bin = str(getattr(settings, "FFMPEG_BIN", None) or "ffmpeg")
+
+    if _settings_bool("PLAYBACK_CLEAN_RESTREAM_ENABLED", True):
+        # Raw/non-annotated playback also benefits from the same buffered H265
+        # decode -> H264 restream path. The annotated path uses playback_clean_*
+        # first and then publishes playback_trace_*; this raw path publishes the
+        # cleaned H264 directly to playback_cam<ID>.
+        decoder = _settings_str("PLAYBACK_CLEAN_RESTREAM_DECODER", "hevc").strip()
+        encoder = _settings_str("PLAYBACK_CLEAN_RESTREAM_ENCODER", "libx264").strip() or "libx264"
+        fps = max(1.0, _settings_float("PLAYBACK_CLEAN_RESTREAM_FPS", 8.0))
+        width = max(0, _settings_int("PLAYBACK_CLEAN_RESTREAM_WIDTH", 1280))
+        height = max(0, _settings_int("PLAYBACK_CLEAN_RESTREAM_HEIGHT", 720))
+        bitrate = _settings_str("PLAYBACK_CLEAN_RESTREAM_BITRATE", "8000k") or "4000k"
+        bufsize = _settings_str("PLAYBACK_CLEAN_RESTREAM_BUFSIZE", "16000k") or "8000k"
+        preset = _settings_str("PLAYBACK_CLEAN_RESTREAM_PRESET", "veryfast") or "veryfast"
+        gop = max(1, _settings_int("PLAYBACK_CLEAN_RESTREAM_GOP", 16))
+        all_i = _settings_bool("PLAYBACK_CLEAN_RESTREAM_ALL_I", True)
+        vf_parts = [f"fps={fps:g}"]
+        if width > 0 and height > 0:
+            width -= width % 2
+            height -= height % 2
+            vf_parts.append(f"scale={width}:{height}:flags=bicubic")
+
+        cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "warning", "-rtsp_transport", "tcp"]
+        cmd += _split_ffmpeg_flags(_settings_str(
+            "PLAYBACK_CLEAN_RESTREAM_FFMPEG_FLAGS",
+            "-fflags +genpts+discardcorrupt -err_detect ignore_err -analyzeduration 10000000 -probesize 10000000 -max_delay 5000000",
+        ))
+        if decoder and decoder.lower() not in {"auto", "none", "default"}:
+            if decoder.lower() in {"hevc_cuvid", "h264_cuvid"}:
+                cmd += ["-hwaccel", "cuda", "-c:v", decoder]
+            else:
+                cmd += ["-c:v", decoder]
+        cmd += ["-i", rtsp_source, "-map", "0:v:0", "-an", "-vf", ",".join(vf_parts), "-c:v", encoder]
+        if encoder.lower() in {"libx264", "h264"}:
+            cmd += [
+                "-preset", preset,
+                "-tune", "zerolatency",
+                "-pix_fmt", "yuv420p",
+                "-b:v", bitrate,
+                "-maxrate", bitrate,
+                "-bufsize", bufsize,
+                "-sc_threshold", "0",
+                "-bf", "0",
+            ]
+            if all_i:
+                cmd += ["-g", "1", "-keyint_min", "1", "-x264-params", "keyint=1:min-keyint=1:scenecut=0"]
+            else:
+                cmd += ["-g", str(gop), "-keyint_min", str(gop)]
+        cmd += ["-f", "rtsp", "-rtsp_transport", "tcp", rtsp_output]
+    else:
+        cmd = [
+            ffmpeg_bin,
+            "-loglevel", "warning",
+            "-rtsp_transport", "tcp",
+            "-fflags", "+genpts+discardcorrupt",
+            "-i", rtsp_source,
+            "-c", "copy",
+            "-f", "rtsp",
+            "-rtsp_transport", "tcp",
+            rtsp_output,
+        ]
 
     log_path = _LOG_DIR / f"{stream_name}.log"
 

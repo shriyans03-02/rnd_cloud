@@ -163,11 +163,44 @@ class Settings(BaseSettings):
     PLAYBACK_HOLD_LAST_FRAME: bool = True
     PLAYBACK_PLACEHOLDER_BEFORE_FIRST_FRAME_ONLY: bool = True
     PLAYBACK_BOOTSTRAP_PLACEHOLDER: bool = True
-    PLAYBACK_WEBRTC_FPS: float = 10.0
-    PLAYBACK_WEBRTC_GOP: int = 20
-    PLAYBACK_WEBRTC_BITRATE: str = "2500k"
-    PLAYBACK_WEBRTC_BUFSIZE: str = "5000k"
-    PLAYBACK_WEBRTC_PRESET: str = "ultrafast"
+    PLAYBACK_WEBRTC_WIDTH: int = 1280
+    PLAYBACK_WEBRTC_HEIGHT: int = 720
+    PLAYBACK_WEBRTC_FPS: float = 8.0
+    PLAYBACK_VIDEO_FPS: float = 8.0
+    PLAYBACK_WEBRTC_GOP: int = 16
+    PLAYBACK_WEBRTC_BITRATE: str = "4000k"
+    PLAYBACK_WEBRTC_BUFSIZE: str = "8000k"
+    PLAYBACK_WEBRTC_PRESET: str = "veryfast"
+    PLAYBACK_WEBRTC_OVERLAY_MAX_AGE_MS: int = 5000
+
+    # CP Plus playback clean restream stage. This is intentionally separate from
+    # the live NVDEC restream: CP Plus H265 playback can start mid-GOP and is
+    # fragile when OpenCV/AI reads it directly. FFmpeg buffers/decodes it first,
+    # republishes a stable local H264 stream to MediaMTX playback_clean_*, then
+    # pipeline_tracing reads that clean stream.
+    PLAYBACK_CLEAN_RESTREAM_ENABLED: bool = True
+    PLAYBACK_CLEAN_RESTREAM_INPUT_CODEC: str = "hevc"
+    PLAYBACK_CLEAN_RESTREAM_DECODER: str = "hevc"  # software HEVC decoder by default
+    PLAYBACK_CLEAN_RESTREAM_ENCODER: str = "libx264"
+    PLAYBACK_CLEAN_RESTREAM_WIDTH: int = 1280
+    PLAYBACK_CLEAN_RESTREAM_HEIGHT: int = 720
+    PLAYBACK_CLEAN_RESTREAM_FPS: float = 8.0
+    PLAYBACK_CLEAN_RESTREAM_BITRATE: str = "8000k"
+    PLAYBACK_CLEAN_RESTREAM_BUFSIZE: str = "16000k"
+    PLAYBACK_CLEAN_RESTREAM_GOP: int = 16
+    PLAYBACK_CLEAN_RESTREAM_ALL_I: bool = True
+    PLAYBACK_CLEAN_RESTREAM_PRESET: str = "veryfast"
+    PLAYBACK_CLEAN_RESTREAM_RTSP_TRANSPORT: str = "tcp"
+    PLAYBACK_CLEAN_RESTREAM_LOG_DIR: str = "logs/playback_clean_restream"
+    PLAYBACK_CLEAN_RESTREAM_PATH_PREFIX: str = "playback_clean_"
+    PLAYBACK_CLEAN_RESTREAM_WARMUP_SECONDS: float = 2.0
+    PLAYBACK_CLEAN_RESTREAM_FFMPEG_FLAGS: str = "-fflags +genpts+discardcorrupt -err_detect ignore_err -analyzeduration 10000000 -probesize 10000000 -max_delay 5000000"
+
+    # Optional playback overlay tuning used by patched pipeline_tracing draw paths.
+    PLAYBACK_OVERLAY_FONT_SCALE: float = 0.45
+    PLAYBACK_OVERLAY_THICKNESS: int = 1
+    PLAYBACK_OVERLAY_LABEL_MAX_CHARS: int = 14
+    PLAYBACK_SHOW_UNKNOWN_LABELS: bool = False
 
     # Camera channel map, e.g. "11:101,12:301,10:201,9:401"
     CHANNEL_MAP: str = ""

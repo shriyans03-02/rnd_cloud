@@ -153,7 +153,15 @@ class Settings(BaseSettings):
     PLAYBACK_FACE_DET_SIZE: str = "640 640"
     PLAYBACK_FACE_EVERY_N: int = 5
     PLAYBACK_VIDEO_FPS: float = 20.0
-    PLAYBACK_QUEUE_SIZE: int = 256
+    # When True, playback behaves like a player: if AI cannot process every
+    # frame, stale decoded frames are skipped so the clip does not run in slow
+    # motion. The source is already clean H264 from playback_clean_*, so dropping
+    # decoded frames here does not break HEVC/H264 reference chains.
+    PLAYBACK_REALTIME_MODE: bool = True
+    PLAYBACK_KEEP_ALL_FRAMES: bool = False
+    PLAYBACK_QUEUE_SIZE: int = 24
+    PLAYBACK_MAX_QUEUE_AGE_MS: int = 1200
+    PLAYBACK_MAX_DRAIN_PER_CYCLE: int = 64
     PLAYBACK_STREAM_FREEZE_SECONDS: float = 300.0
     PLAYBACK_STREAM_OPEN_TIMEOUT_MS: int = 8000
     PLAYBACK_STREAM_READ_TIMEOUT_MS: int = 8000
@@ -165,12 +173,13 @@ class Settings(BaseSettings):
     PLAYBACK_BOOTSTRAP_PLACEHOLDER: bool = True
     PLAYBACK_WEBRTC_WIDTH: int = 1280
     PLAYBACK_WEBRTC_HEIGHT: int = 720
-    PLAYBACK_WEBRTC_FPS: float = 8.0
-    PLAYBACK_VIDEO_FPS: float = 8.0
-    PLAYBACK_WEBRTC_GOP: int = 16
-    PLAYBACK_WEBRTC_BITRATE: str = "4000k"
-    PLAYBACK_WEBRTC_BUFSIZE: str = "8000k"
-    PLAYBACK_WEBRTC_PRESET: str = "veryfast"
+    PLAYBACK_WEBRTC_FPS: float = 15.0
+    PLAYBACK_VIDEO_FPS: float = 15.0
+    PLAYBACK_WEBRTC_GOP: int = 30
+    PLAYBACK_WEBRTC_CODEC: str = "libx264"
+    PLAYBACK_WEBRTC_BITRATE: str = "5000k"
+    PLAYBACK_WEBRTC_BUFSIZE: str = "10000k"
+    PLAYBACK_WEBRTC_PRESET: str = "ultrafast"
     PLAYBACK_WEBRTC_OVERLAY_MAX_AGE_MS: int = 5000
 
     # CP Plus playback clean restream stage. This is intentionally separate from
@@ -184,11 +193,11 @@ class Settings(BaseSettings):
     PLAYBACK_CLEAN_RESTREAM_ENCODER: str = "libx264"
     PLAYBACK_CLEAN_RESTREAM_WIDTH: int = 1280
     PLAYBACK_CLEAN_RESTREAM_HEIGHT: int = 720
-    PLAYBACK_CLEAN_RESTREAM_FPS: float = 8.0
-    PLAYBACK_CLEAN_RESTREAM_BITRATE: str = "8000k"
-    PLAYBACK_CLEAN_RESTREAM_BUFSIZE: str = "16000k"
-    PLAYBACK_CLEAN_RESTREAM_GOP: int = 16
-    PLAYBACK_CLEAN_RESTREAM_ALL_I: bool = True
+    PLAYBACK_CLEAN_RESTREAM_FPS: float = 15.0
+    PLAYBACK_CLEAN_RESTREAM_BITRATE: str = "5000k"
+    PLAYBACK_CLEAN_RESTREAM_BUFSIZE: str = "10000k"
+    PLAYBACK_CLEAN_RESTREAM_GOP: int = 30
+    PLAYBACK_CLEAN_RESTREAM_ALL_I: bool = False
     PLAYBACK_CLEAN_RESTREAM_PRESET: str = "veryfast"
     PLAYBACK_CLEAN_RESTREAM_RTSP_TRANSPORT: str = "tcp"
     PLAYBACK_CLEAN_RESTREAM_LOG_DIR: str = "logs/playback_clean_restream"

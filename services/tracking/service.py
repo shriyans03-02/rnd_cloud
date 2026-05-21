@@ -480,10 +480,12 @@ class AnnotatedRtspPublisher:
             keyint = max(1, int(round(self.fps * 2.0)))
 
         preset = str(os.environ.get("PLAYBACK_WEBRTC_PRESET", "ultrafast") or "ultrafast").strip()
-        bitrate = str(os.environ.get("PLAYBACK_WEBRTC_BITRATE", "2500k") or "2500k").strip()
-        bufsize = str(os.environ.get("PLAYBACK_WEBRTC_BUFSIZE", "5000k") or "5000k").strip()
+        bitrate = str(os.environ.get("PLAYBACK_WEBRTC_BITRATE", "5000k") or "5000k").strip()
+        bufsize = str(os.environ.get("PLAYBACK_WEBRTC_BUFSIZE", "10000k") or "10000k").strip()
+        codec = str(self.codec or "libx264").strip() or "libx264"
+        codec_lower = codec.lower()
 
-        return [
+        cmd = [
             self.ffmpeg_bin,
             "-loglevel", "error",
             "-fflags", "+genpts",
@@ -493,25 +495,50 @@ class AnnotatedRtspPublisher:
             "-r", fps_txt,
             "-i", "-",
             "-an",
-            "-c:v", self.codec,
-            "-preset", preset,
-            "-tune", "zerolatency",
-            "-profile:v", "baseline",
-            "-level:v", "3.1",
-            "-pix_fmt", "yuv420p",
-            "-b:v", bitrate,
-            "-maxrate", bitrate,
-            "-bufsize", bufsize,
-            "-g", str(keyint),
-            "-keyint_min", str(keyint),
-            "-sc_threshold", "0",
-            "-bf", "0",
+            "-c:v", codec,
+        ]
+
+        if codec_lower in {"h264_nvenc", "hevc_nvenc"}:
+            # NVENC uses the GPU video encoder block and removes the CPU x264
+            # bottleneck from playback_trace_* publishing. Keep it optional;
+            # libx264 remains the fallback for machines without NVENC.
+            nv_preset = preset
+            if nv_preset in {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"}:
+                nv_preset = "p2" if nv_preset in {"ultrafast", "superfast"} else "p3"
+            cmd += [
+                "-preset", nv_preset,
+                "-tune", "ll",
+                "-pix_fmt", "yuv420p",
+                "-b:v", bitrate,
+                "-maxrate", bitrate,
+                "-bufsize", bufsize,
+                "-g", str(keyint),
+                "-bf", "0",
+            ]
+        else:
+            cmd += [
+                "-preset", preset,
+                "-tune", "zerolatency",
+                "-profile:v", "baseline",
+                "-level:v", "3.1",
+                "-pix_fmt", "yuv420p",
+                "-b:v", bitrate,
+                "-maxrate", bitrate,
+                "-bufsize", bufsize,
+                "-g", str(keyint),
+                "-keyint_min", str(keyint),
+                "-sc_threshold", "0",
+                "-bf", "0",
+            ]
+
+        cmd += [
             "-muxdelay", "0",
             "-muxpreload", "0",
             "-f", "rtsp",
             "-rtsp_transport", "tcp",
             self.rtsp_output,
         ]
+        return cmd
 
     def _start_proc(self, w: int, h: int) -> None:
         os.makedirs(os.path.dirname(self.debug_log_path) or ".", exist_ok=True)
@@ -1268,9 +1295,21 @@ class PlaybackTracingService:
         except Exception:
             args.video_fps = 10.0
         try:
-            args.queue_size = max(16, int(getattr(settings, "PLAYBACK_QUEUE_SIZE", 256) or os.environ.get("PLAYBACK_QUEUE_SIZE", 256) or 256))
+            q_default = 24 if self._env_bool("PLAYBACK_REALTIME_MODE", bool(getattr(settings, "PLAYBACK_REALTIME_MODE", True))) else 256
+            args.queue_size = max(1, int(os.environ.get("PLAYBACK_QUEUE_SIZE") or getattr(settings, "PLAYBACK_QUEUE_SIZE", q_default) or q_default))
         except Exception:
-            args.queue_size = 256
+            args.queue_size = 24
+        try:
+            realtime_mode = self._env_bool("PLAYBACK_REALTIME_MODE", bool(getattr(settings, "PLAYBACK_REALTIME_MODE", True)))
+            keep_all = self._env_bool("PLAYBACK_KEEP_ALL_FRAMES", bool(getattr(settings, "PLAYBACK_KEEP_ALL_FRAMES", False)))
+            default_age = 0 if keep_all or (not realtime_mode) else 1200
+            args.max_queue_age_ms = max(0, int(os.environ.get("PLAYBACK_MAX_QUEUE_AGE_MS") or getattr(settings, "PLAYBACK_MAX_QUEUE_AGE_MS", default_age) or default_age))
+        except Exception:
+            args.max_queue_age_ms = 1200
+        try:
+            args.max_drain_per_cycle = max(1, int(os.environ.get("PLAYBACK_MAX_DRAIN_PER_CYCLE") or getattr(settings, "PLAYBACK_MAX_DRAIN_PER_CYCLE", 64) or 64))
+        except Exception:
+            args.max_drain_per_cycle = 64
         try:
             args.stream_freeze_seconds = max(30.0, float(getattr(settings, "PLAYBACK_STREAM_FREEZE_SECONDS", 300.0) or os.environ.get("PLAYBACK_STREAM_FREEZE_SECONDS", 300.0) or 300.0))
         except Exception:
@@ -1312,13 +1351,19 @@ class PlaybackTracingService:
         args.gallery_member_ids = [int(member_id)] if member_id is not None else []
         args.gallery_member_names = [member_name] if member_name else []
 
-        # Playback requests should prioritize correctness over low-latency frame dropping.
+        # Playback requests now read from a clean local H264 restream.  In realtime
+        # playback mode we are allowed to skip stale *decoded* frames so the UI
+        # does not run in slow motion.  Set PLAYBACK_KEEP_ALL_FRAMES=True only for
+        # offline analysis where completeness is more important than realtime speed.
         try:
-            args.max_queue_age_ms = 0
-        except Exception:
-            pass
-        try:
-            args.queue_size = max(256, int(getattr(args, "queue_size", 128) or 128))
+            realtime_mode = self._env_bool("PLAYBACK_REALTIME_MODE", bool(getattr(settings, "PLAYBACK_REALTIME_MODE", True)))
+            keep_all = self._env_bool("PLAYBACK_KEEP_ALL_FRAMES", bool(getattr(settings, "PLAYBACK_KEEP_ALL_FRAMES", False)))
+            if keep_all or (not realtime_mode):
+                args.max_queue_age_ms = max(0, int(os.environ.get("PLAYBACK_MAX_QUEUE_AGE_MS") or getattr(settings, "PLAYBACK_MAX_QUEUE_AGE_MS", 0) or 0))
+                args.queue_size = max(64, int(os.environ.get("PLAYBACK_QUEUE_SIZE") or getattr(args, "queue_size", 256) or 256))
+            else:
+                args.max_queue_age_ms = max(1, int(os.environ.get("PLAYBACK_MAX_QUEUE_AGE_MS") or getattr(settings, "PLAYBACK_MAX_QUEUE_AGE_MS", 1200) or 1200))
+                args.queue_size = max(1, int(os.environ.get("PLAYBACK_QUEUE_SIZE") or getattr(args, "queue_size", 24) or 24))
         except Exception:
             pass
         try:
@@ -1549,6 +1594,7 @@ class PlaybackTracingService:
             ffmpeg_bin=str(getattr(settings, "FFMPEG_BIN", "ffmpeg") or "ffmpeg"),
             mediamtx_rtsp_base=str(getattr(settings, "MEDIAMTX_RTSP", "") or ""),
             fps=float(getattr(args, "video_fps", 20.0) or 20.0),
+            codec=_setting_str("PLAYBACK_WEBRTC_CODEC", "libx264") or "libx264",
         )
         try:
             publisher.start()

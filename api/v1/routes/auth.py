@@ -1,12 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, Response, Request
+from fastapi import APIRouter, Depends, HTTPException, Response, Request, Body
 from sqlalchemy.orm import Session
 import secrets
 import json
 import base64
-from datetime import timedelta
-
-import redis.asyncio as aioredis
-
 from app.db.session import get_db
 from app.services.auth_service import AuthService
 from app.schemas.auth import LoginRequest, LoginResponse, RegisterRequest, RegisterResponse
@@ -16,8 +12,13 @@ from app.core.config import settings
 from app.core.dependencies import get_current_user
 from app.db.models.user import User
 from app.core.redis import get_redis
+from pydantic import BaseModel
 
 router = APIRouter()
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str | None = None
 
 JWT_COOKIE_KEY       = settings.JWT_COOKIE_KEY
 USER_INFO_COOKIE_KEY = settings.USER_INFO_COOKIE_KEY
@@ -28,13 +29,32 @@ IS_SECURE            = settings.SECURE_COOKIES
 
 
 def _cookie_defaults(httponly: bool, max_age: int) -> dict:
+    # SameSite=None is only valid in modern browsers when Secure=True.
+    # For the current HTTP VM deployment, use non-secure + Lax cookies.
     return dict(
         httponly=httponly,
-        secure=True,        # ← hardcode True, not IS_SECURE from env
-        samesite="none",    # ← was "strict", must be "none" for cross-origin
+        secure=IS_SECURE,
+        samesite="none" if IS_SECURE else "lax",
         max_age=max_age,
         path="/",
     )
+
+
+def _delete_cookie_defaults() -> dict:
+    return dict(
+        path="/",
+        secure=IS_SECURE,
+        samesite="none" if IS_SECURE else "lax",
+    )
+
+
+def _clean_token(value: str | None) -> str | None:
+    if not value:
+        return None
+    token = value.strip()
+    if not token or token.lower() in {"undefined", "null"}:
+        return None
+    return token
 
 
 def _set_auth_cookies(response: Response, user: User, access_token: str) -> None:
@@ -115,10 +135,11 @@ async def login(payload: LoginRequest, response: Response, db: Session = Depends
         refresh_token = _set_auth_cookies(response, user, token_data.access_token)
         await _store_refresh_token(refresh_token, user.id)
 
-        # Return token + user in body for cross-origin environments
+        # Return token + user in body for the frontend token flow.
         return {
             "ok": True,
             "access_token": token_data.access_token,
+            "refresh_token": refresh_token,
             "user": {
                 "id": user.id,
                 "name": f"{user.first_name} {user.last_name}".strip(),
@@ -132,8 +153,18 @@ async def login(payload: LoginRequest, response: Response, db: Session = Depends
 
 
 @router.post("/refresh")
-async def refresh(request: Request, response: Response, db: Session = Depends(get_db)):
-    refresh_token = request.cookies.get(REFRESH_COOKIE_KEY)
+async def refresh(
+    request: Request,
+    response: Response,
+    payload: RefreshRequest | None = Body(default=None),
+    db: Session = Depends(get_db),
+):
+    # Accept both flows:
+    # 1) HttpOnly cookie refresh_token, and
+    # 2) frontend JSON body {"refresh_token": "..."}.
+    refresh_token = _clean_token(payload.refresh_token if payload else None)
+    if not refresh_token:
+        refresh_token = _clean_token(request.cookies.get(REFRESH_COOKIE_KEY))
     if not refresh_token:
         raise HTTPException(status_code=401, detail="No refresh token")
 
@@ -158,16 +189,24 @@ async def refresh(request: Request, response: Response, db: Session = Depends(ge
     new_refresh = _set_auth_cookies(response, user, token_data.access_token)
     await _store_refresh_token(new_refresh, user.id)
 
-    # Also return new token in body
+    # Return the rotated refresh token too, because the frontend stores it.
     return {
         "ok": True,
         "access_token": token_data.access_token,
+        "refresh_token": new_refresh,
     }
 
 
 @router.post("/logout")
-async def logout(request: Request, response: Response, db: Session = Depends(get_db)):
-    refresh_token = request.cookies.get(REFRESH_COOKIE_KEY)
+async def logout(
+    request: Request,
+    response: Response,
+    payload: RefreshRequest | None = Body(default=None),
+    db: Session = Depends(get_db),
+):
+    refresh_token = _clean_token(payload.refresh_token if payload else None)
+    if not refresh_token:
+        refresh_token = _clean_token(request.cookies.get(REFRESH_COOKIE_KEY))
 
     if refresh_token:
         try:
@@ -204,9 +243,9 @@ async def logout(request: Request, response: Response, db: Session = Depends(get
             pass  # Redis down — skip logging and revocation, cookies still get cleared
 
     # Always runs regardless of Redis state
-    response.delete_cookie(key=JWT_COOKIE_KEY, path="/")
-    response.delete_cookie(key=REFRESH_COOKIE_KEY, path="/")
-    response.delete_cookie(key=USER_INFO_COOKIE_KEY, path="/")
+    response.delete_cookie(key=JWT_COOKIE_KEY, **_delete_cookie_defaults())
+    response.delete_cookie(key=REFRESH_COOKIE_KEY, **_delete_cookie_defaults())
+    response.delete_cookie(key=USER_INFO_COOKIE_KEY, **_delete_cookie_defaults())
     return {"ok": True}
 
 

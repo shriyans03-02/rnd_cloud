@@ -26,7 +26,7 @@ def get_current_user(
 
     # 2. Cookie fallback (local dev — same origin)
     if not token:
-        token = request.cookies.get("access_token")
+        token = request.cookies.get(settings.JWT_COOKIE_KEY)
 
     if not token:
         raise HTTPException(

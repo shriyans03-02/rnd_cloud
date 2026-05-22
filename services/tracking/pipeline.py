@@ -5027,7 +5027,8 @@
 #                 color = (0, 0, 255)
 #             else:
 #                 color = (0, 255, 255)
-#             label_txt = "Unknown"
+#             show_unknown_labels = str(os.environ.get("TRACKING_SHOW_UNKNOWN_LABELS", "true")).strip().lower() in {"1", "true", "yes", "on", "y"}
+#             label_txt = "Unknown" if show_unknown_labels else ""
 
 #         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
 #         cv2.putText(out, label_txt, (x1, max(0, y1 - 7)),
@@ -7145,7 +7146,8 @@
 #             )
 #         else:
 #             color = (0, 255, 255)
-#             label_txt = f"Unknown (T{show_raw_tid})"
+#             show_unknown_labels = str(os.environ.get("TRACKING_SHOW_UNKNOWN_LABELS", "true")).strip().lower() in {"1", "true", "yes", "on", "y"}
+#             label_txt = f"Unknown (T{show_raw_tid})" if show_unknown_labels else ""
 
 #         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
 
@@ -13449,7 +13451,8 @@ def process_one_frame(
                 color = (0, 0, 255)
             else:
                 color = (0, 255, 255)
-            label_txt = "Unknown"
+            show_unknown_labels = str(os.environ.get("TRACKING_SHOW_UNKNOWN_LABELS", "true")).strip().lower() in {"1", "true", "yes", "on", "y"}
+            label_txt = "Unknown" if show_unknown_labels else ""
 
         cv2.rectangle(out, (x1, y1), (x2, y2), color, box_thickness)
         cv2.putText(out, label_txt, (x1, max(0, y1 - 7)),
@@ -16118,7 +16121,8 @@ def process_one_frame(
             label_txt = f"{it.name} | ID {show_raw_tid}"
         else:
             color = (0, 255, 255)
-            label_txt = f"Unknown | ID {show_raw_tid}"
+            show_unknown_labels = str(os.environ.get("TRACKING_SHOW_UNKNOWN_LABELS", "true")).strip().lower() in {"1", "true", "yes", "on", "y"}
+            label_txt = f"Unknown | ID {show_raw_tid}" if show_unknown_labels else ""
 
         cv2.rectangle(out, (x1, y1), (x2, y2), color, box_thickness)
 

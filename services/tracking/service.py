@@ -74,6 +74,8 @@ class DetectionService:
         if not getattr(args, "db_url", ""):
             args.db_url = os.environ.get("DATABASE_URL", "") or ""
 
+        self._apply_live_visibility_overrides(args)
+
         self._runner = LiveTrackingRunner(args)
         try:
             self._runner.start()
@@ -96,6 +98,30 @@ class DetectionService:
                 pass
             self._runner = None
             raise
+
+    @staticmethod
+    def _env_bool(name: str, default: bool) -> bool:
+        raw = os.environ.get(str(name))
+        if raw is None or str(raw).strip() == "":
+            return bool(default)
+        return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+    def _apply_live_visibility_overrides(self, args: argparse.Namespace) -> None:
+        # Live and playback must not share unknown-box policy.  Live defaults to
+        # showing unknown people; playback tracing can hide unknowns separately.
+        try:
+            args.is_playback = False
+        except Exception:
+            pass
+        try:
+            args.hide_unknown = self._env_bool(
+                "TRACKING_HIDE_UNKNOWN",
+                bool(getattr(settings, "TRACKING_HIDE_UNKNOWN", False)),
+            )
+        except Exception:
+            pass
+        # Keep tracker IDs visible in live unless explicitly disabled by normal
+        # pipeline args.  Unknown labels are handled by the publisher/draw code.
 
     @staticmethod
     def _live_stream_name(camera_id: int) -> str:
@@ -953,10 +979,15 @@ class PlaybackCleanRestream:
 
         cmd: list[str] = [self.ffmpeg_bin, "-hide_banner", "-loglevel", "warning"]
         cmd += ["-rtsp_transport", rtsp_transport]
+        # Do not use discardcorrupt by default for CP Plus playback.
+        # VLC looks smooth because it keeps/recovers many HEVC frames that FFmpeg
+        # would otherwise mark as damaged.  Dropping those packets makes the
+        # local playback_clean_* stream look smooth in WebRTC FPS counters but
+        # visually slow, because most motion frames are discarded and repeated.
         cmd += _split_ffmpeg_flags(
             _setting_str(
                 "PLAYBACK_CLEAN_RESTREAM_FFMPEG_FLAGS",
-                "-fflags +genpts+discardcorrupt -err_detect ignore_err -analyzeduration 10000000 -probesize 10000000 -max_delay 5000000",
+                "-fflags +genpts -flags2 +showall -err_detect ignore_err -analyzeduration 10000000 -probesize 10000000 -max_delay 5000000",
             )
         )
 
@@ -971,13 +1002,19 @@ class PlaybackCleanRestream:
 
         cmd += ["-i", self.raw_rtsp_source, "-map", "0:v:0", "-an"]
 
-        vf_parts: list[str] = [f"fps={fps:g}"]
+        # Keep the clean restream motion paced by the NVR/decoder timestamps.
+        # A forced fps filter can duplicate sparse decoded frames and make the
+        # playback appear like slow motion.  Use it only when explicitly enabled.
+        vf_parts: list[str] = []
+        if _setting_bool("PLAYBACK_CLEAN_RESTREAM_FORCE_FPS_FILTER", False):
+            vf_parts.append(f"fps={fps:g}")
         if width > 0 and height > 0:
             # Ensure even dimensions for yuv420p/H264.
             width -= width % 2
             height -= height % 2
             vf_parts.append(f"scale={width}:{height}:flags=bicubic")
-        cmd += ["-vf", ",".join(vf_parts)]
+        if vf_parts:
+            cmd += ["-vf", ",".join(vf_parts)]
 
         cmd += ["-c:v", encoder]
         enc_lower = encoder.lower()
@@ -1203,6 +1240,26 @@ class PlaybackTracingService:
         return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
 
     @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        raw = os.environ.get(str(name))
+        if raw is None or str(raw).strip() == "":
+            return int(default)
+        try:
+            return int(str(raw).strip())
+        except Exception:
+            return int(default)
+
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        raw = os.environ.get(str(name))
+        if raw is None or str(raw).strip() == "":
+            return float(default)
+        try:
+            return float(str(raw).strip())
+        except Exception:
+            return float(default)
+
+    @staticmethod
     def _parse_face_det_size(value: Any, default: tuple[int, int] = (640, 640)) -> list[int]:
         try:
             if isinstance(value, (list, tuple)) and len(value) >= 2:
@@ -1336,6 +1393,7 @@ class PlaybackTracingService:
         self._apply_playback_stability_overrides(args)
         args.src = [str(rtsp_source)]
         args.camera_ids = [int(camera_id)]
+        args.is_playback = True
         args.use_db = True
         if not getattr(args, "db_url", ""):
             args.db_url = os.environ.get("DATABASE_URL", "") or ""
@@ -1349,9 +1407,58 @@ class PlaybackTracingService:
         args.overlay_fps = self._env_bool("PLAYBACK_OVERLAY_FPS", True)
         args.write_normalized_data = False
         args.update_db_embeddings = False
-        args.gallery_request_mode = str(request_mode or "location")
+        mode_norm = str(request_mode or "location").strip().lower() or "location"
+        if mode_norm not in {"member", "location"}:
+            mode_norm = "member" if member_id is not None or str(member_name or "").strip() else "location"
+
+        # Identity gallery policy:
+        # - member playback: load ONLY the requested member's face embeddings
+        # - location playback: load ALL active members' face embeddings
+        # This is what makes CP Plus playback identify the selected member in
+        # member tracing, and identify any enrolled member in location playback.
+        args.gallery_request_mode = mode_norm
         args.gallery_member_ids = [int(member_id)] if member_id is not None else []
         args.gallery_member_names = [member_name] if member_name else []
+
+        identity_matching_enabled = self._env_bool("PLAYBACK_IDENTITY_MATCHING_ENABLED", True)
+        force_face_for_identity = self._env_bool("PLAYBACK_FORCE_FACE_FOR_IDENTITY", True)
+        if identity_matching_enabled and force_face_for_identity:
+            # PLAYBACK_USE_FACE may be False for the fastest box-only mode.  For
+            # tracing by member/location we must enable InsightFace, otherwise
+            # the DB embeddings are loaded but never used. Keep provider on CPU
+            # by default to avoid the earlier CUDA/ONNX/cuDNN crash path.
+            args.use_face = True
+
+        if identity_matching_enabled:
+            args.face_provider = str(os.environ.get("PLAYBACK_FACE_PROVIDER") or getattr(settings, "PLAYBACK_FACE_PROVIDER", "cpu") or "cpu").strip().lower()
+            if args.face_provider not in {"auto", "cuda", "cpu"}:
+                args.face_provider = "cpu"
+            args.face_det_size = self._parse_face_det_size(os.environ.get("PLAYBACK_FACE_DET_SIZE") or getattr(settings, "PLAYBACK_FACE_DET_SIZE", "640 640"), default=(640, 640))
+
+            # Member mode gets a more frequent face pass because only one
+            # identity is in the gallery. Location mode matches all identities,
+            # so keep it a little less frequent to preserve playback smoothness.
+            if mode_norm == "member":
+                args.face_every_n = max(1, self._env_int("PLAYBACK_MEMBER_FACE_EVERY_N", self._env_int("PLAYBACK_FACE_EVERY_N", 5)))
+                args.face_confirm_hits = max(1, self._env_int("PLAYBACK_MEMBER_FACE_CONFIRM_HITS", 1))
+                args.face_switch_confirm_hits = max(1, self._env_int("PLAYBACK_MEMBER_FACE_SWITCH_CONFIRM_HITS", 1))
+                args.camera_name_switch_hits = max(1, self._env_int("PLAYBACK_MEMBER_CAMERA_NAME_SWITCH_HITS", 1))
+            else:
+                args.face_every_n = max(1, self._env_int("PLAYBACK_LOCATION_FACE_EVERY_N", self._env_int("PLAYBACK_FACE_EVERY_N", 10)))
+                args.face_confirm_hits = max(1, self._env_int("PLAYBACK_LOCATION_FACE_CONFIRM_HITS", 2))
+                args.face_switch_confirm_hits = max(1, self._env_int("PLAYBACK_LOCATION_FACE_SWITCH_CONFIRM_HITS", 2))
+                args.camera_name_switch_hits = max(1, self._env_int("PLAYBACK_LOCATION_CAMERA_NAME_SWITCH_HITS", 2))
+
+            # CP Plus playback has re-encoded/compressed frames; use slightly
+            # more forgiving thresholds than the live pipeline, but still require
+            # a top1-top2 gap to reduce wrong IDs.
+            args.face_thresh = self._env_float("PLAYBACK_FACE_THRESH", float(getattr(args, "face_thresh", 0.50) or 0.50))
+            args.face_gap = self._env_float("PLAYBACK_FACE_GAP", float(getattr(args, "face_gap", 0.05) or 0.05))
+            args.face_strong_thresh = self._env_float("PLAYBACK_FACE_STRONG_THRESH", max(float(args.face_thresh), 0.50))
+            args.embed_min_face_det_score = self._env_float("PLAYBACK_MIN_FACE_DET_SCORE", float(getattr(args, "embed_min_face_det_score", 0.50) or 0.50))
+            args.min_face_px = max(8, self._env_int("PLAYBACK_MIN_FACE_PX", int(getattr(args, "min_face_px", 24) or 24)))
+            args.min_face_area_ratio = max(0.0, self._env_float("PLAYBACK_MIN_FACE_AREA_RATIO", float(getattr(args, "min_face_area_ratio", 0.006) or 0.006)))
+            args.face_iou_link = max(0.01, self._env_float("PLAYBACK_FACE_IOU_LINK", float(getattr(args, "face_iou_link", 0.35) or 0.35)))
 
         # Playback requests now read from a clean local H264 restream.  In realtime
         # playback mode we are allowed to skip stale *decoded* frames so the UI
@@ -1389,20 +1496,18 @@ class PlaybackTracingService:
         except Exception:
             pass
 
-        # Member playback should show only the target person when face matching
-        # is enabled. If playback is running in CPU/no-face stabilisation mode,
-        # keep Unknown boxes visible instead of returning a clean video with all
-        # boxes hidden. This avoids perceived information loss while still
-        # preventing the CUDA crash path.
-        # Always keep boxes visible in playback.  Member-mode still filters the
-        # DB gallery to the requested member, but unknown/unconfirmed people must
-        # stay visible with tracker IDs; otherwise the user sees a clean video
-        # with no boxes until face recognition confirms a name.
-        args.hide_unknown = False
-        if str(request_mode) == "member":
-            args.face_confirm_hits = 1
-            args.face_switch_confirm_hits = 1
-            args.camera_name_switch_hits = 1
+        # Playback overlay visibility policy.
+        # For tracking/re-ID playback, hide unknown/unconfirmed tracks by default
+        # so the UI shows only confirmed known people from the embedding gallery.
+        # Set PLAYBACK_HIDE_UNKNOWN=False to show all tracker boxes for debugging.
+        args.hide_unknown = self._env_bool("PLAYBACK_HIDE_UNKNOWN", True)
+
+        # Low-latency playback tracing: when AI is slower than the clean RTSP
+        # stream, always process the newest decoded frame instead of working
+        # through an old queue.  Raw WebRTC motion is independent, but this keeps
+        # the overlay/identity boxes within the 100-500 ms target range.
+        args.playback_ai_read_latest_only = self._env_bool("PLAYBACK_AI_READ_LATEST_ONLY", True)
+
 
         return args
 
@@ -1435,6 +1540,122 @@ class PlaybackTracingService:
                     continue
                 ids.append(str(session_id))
         return ids
+
+    @staticmethod
+    def _buffer_wait_result(ret: Any, previous_seq: int) -> tuple[Optional[np.ndarray], float, Dict[str, Any], int]:
+        frame: Optional[np.ndarray] = None
+        ts = 0.0
+        meta: Dict[str, Any] = {}
+        seq = int(previous_seq)
+        if isinstance(ret, (list, tuple)):
+            if len(ret) >= 1 and isinstance(ret[0], np.ndarray):
+                frame = ret[0]
+            if len(ret) >= 2:
+                try:
+                    ts = float(ret[1] or 0.0)
+                except Exception:
+                    ts = 0.0
+            if len(ret) >= 3 and isinstance(ret[2], dict):
+                meta = dict(ret[2])
+            if len(ret) >= 4:
+                try:
+                    seq = int(ret[3])
+                except Exception:
+                    seq = int(previous_seq)
+        elif isinstance(ret, np.ndarray):
+            frame = ret
+            seq = int(previous_seq) + 1
+            ts = time.time()
+        return frame, ts, meta, int(seq)
+
+    def _wait_for_buffer_frame(
+        self,
+        buf: Any,
+        *,
+        timeout_seconds: float,
+        require_success: bool = False,
+        label: str = "buffer",
+    ) -> tuple[bool, Dict[str, Any]]:
+        """Wait until a RenderedFrame-like buffer has a real frame.
+
+        For processed AI buffers, `require_success=True` ignores diagnostic
+        frames with process_error=True. This allows the service to detect a
+        stuck/failing CUDA playback AI runner and restart it on CPU before the
+        UI sees a permanent AI FPS 0 stream.
+        """
+        timeout = float(max(0.0, float(timeout_seconds or 0.0)))
+        if buf is None or timeout <= 0.0:
+            return False, {"reason": "missing_or_zero_timeout", "label": str(label)}
+        deadline = time.monotonic() + timeout
+        last_seq = -1
+        last_meta: Dict[str, Any] = {}
+        last_reason = "timeout"
+        while time.monotonic() < deadline:
+            wait_s = min(0.5, max(0.01, deadline - time.monotonic()))
+            try:
+                if hasattr(buf, "wait_for_seq"):
+                    ret = buf.wait_for_seq(last_seq, timeout=wait_s)
+                elif hasattr(buf, "get"):
+                    ret = buf.get()
+                    time.sleep(min(0.05, wait_s))
+                else:
+                    return False, {"reason": "unsupported_buffer", "label": str(label)}
+                frame, ts, meta, seq = self._buffer_wait_result(ret, last_seq)
+            except Exception as exc:
+                return False, {"reason": f"buffer_wait_failed: {exc}", "label": str(label)}
+            if int(seq) <= int(last_seq):
+                continue
+            last_seq = int(seq)
+            last_meta = dict(meta or {})
+            has_frame = bool(frame is not None and getattr(frame, "size", 0) != 0)
+            if not has_frame:
+                last_reason = "seq_without_frame"
+                continue
+            if require_success and bool(last_meta.get("process_error")):
+                last_reason = str(last_meta.get("ai_error") or last_meta.get("process_error") or "process_error")
+                continue
+            return True, {
+                "reason": "ready",
+                "label": str(label),
+                "seq": int(seq),
+                "ts": float(ts or 0.0),
+                "meta": last_meta,
+            }
+        return False, {"reason": last_reason, "label": str(label), "meta": last_meta}
+
+    def _playback_float(self, name: str, default: float) -> float:
+        try:
+            return float(os.environ.get(name) or getattr(settings, name, default) or default)
+        except Exception:
+            return float(default)
+
+    def _playback_bool(self, name: str, default: bool) -> bool:
+        try:
+            return self._env_bool(name, bool(getattr(settings, name, default)))
+        except Exception:
+            return bool(default)
+
+    def _should_fallback_playback_ai(self, args: argparse.Namespace) -> bool:
+        device = str(getattr(args, "device", "") or "").lower().strip()
+        if not device.startswith("cuda"):
+            return False
+        return self._playback_bool("PLAYBACK_AI_FALLBACK_ON_TIMEOUT", True)
+
+    def _make_fallback_args(self, args: argparse.Namespace) -> argparse.Namespace:
+        fallback = copy.deepcopy(args)
+        fallback_device = str(os.environ.get("PLAYBACK_AI_FALLBACK_DEVICE") or getattr(settings, "PLAYBACK_AI_FALLBACK_DEVICE", "cpu") or "cpu").strip()
+        if not fallback_device:
+            fallback_device = "cpu"
+        fallback.device = fallback_device
+        if not str(fallback_device).lower().startswith("cuda"):
+            fallback.half = False
+            fallback.cudnn_benchmark = False
+            # Keep playback responsive if CPU fallback is used.
+            try:
+                fallback.yolo_imgsz = min(int(getattr(fallback, "yolo_imgsz", 512) or 512), 512)
+            except Exception:
+                fallback.yolo_imgsz = 512
+        return fallback
 
     def _watch_session(self, session_id: str) -> None:
         while self.is_session_active(session_id):
@@ -1598,6 +1819,84 @@ class PlaybackTracingService:
                 except Exception:
                     pass
             raise RuntimeError(f"Camera buffer not available for camera_id={int(camera_id)}")
+
+        raw_wait_s = self._playback_float("PLAYBACK_WAIT_FOR_RAW_SECONDS", 30.0)
+        ai_wait_s = self._playback_float("PLAYBACK_WAIT_FOR_AI_SECONDS", 10.0)
+        raw_ready, raw_wait_info = self._wait_for_buffer_frame(
+            raw_buf if raw_buf is not None else buf,
+            timeout_seconds=raw_wait_s,
+            require_success=False,
+            label="raw",
+        )
+        if raw_ready:
+            print(f"[PLAYBACK-AI] raw clean frames ready camera_id={int(camera_id)} source={pipeline_rtsp_source}")
+        else:
+            print(f"[PLAYBACK-AI] raw clean frames not ready yet camera_id={int(camera_id)} info={raw_wait_info}")
+
+        ai_ready, ai_wait_info = self._wait_for_buffer_frame(
+            buf,
+            timeout_seconds=ai_wait_s,
+            require_success=True,
+            label="processed_ai",
+        )
+
+        if (not ai_ready) and self._should_fallback_playback_ai(args):
+            print(
+                f"[PLAYBACK-AI] no processed AI frame from GPU after {ai_wait_s:.1f}s; "
+                f"restarting playback AI runner with {os.environ.get('PLAYBACK_AI_FALLBACK_DEVICE') or getattr(settings, 'PLAYBACK_AI_FALLBACK_DEVICE', 'cpu')} | info={ai_wait_info}"
+            )
+            try:
+                runner.stop()
+            except Exception:
+                pass
+            args = self._make_fallback_args(args)
+            runner = TrackingRunner(args)
+            try:
+                runner.start()
+            except Exception:
+                try:
+                    runner.stop()
+                except Exception:
+                    pass
+                if clean_restream is not None:
+                    try:
+                        clean_restream.stop()
+                    except Exception:
+                        pass
+                raise
+            buf = runner.get_camera_buffer(int(camera_id))
+            try:
+                raw_buf = runner.get_camera_raw_buffer(int(camera_id))
+            except Exception:
+                raw_buf = None
+            if buf is None:
+                try:
+                    runner.stop()
+                except Exception:
+                    pass
+                if clean_restream is not None:
+                    try:
+                        clean_restream.stop()
+                    except Exception:
+                        pass
+                raise RuntimeError(f"Camera buffer not available after AI fallback for camera_id={int(camera_id)}")
+            raw_ready, raw_wait_info = self._wait_for_buffer_frame(
+                raw_buf if raw_buf is not None else buf,
+                timeout_seconds=min(max(2.0, raw_wait_s), 15.0),
+                require_success=False,
+                label="raw_fallback",
+            )
+            ai_ready, ai_wait_info = self._wait_for_buffer_frame(
+                buf,
+                timeout_seconds=max(2.0, ai_wait_s),
+                require_success=True,
+                label="processed_ai_fallback",
+            )
+
+        if ai_ready:
+            print(f"[PLAYBACK-AI] processed AI frames ready camera_id={int(camera_id)} device={getattr(args, 'device', '')}")
+        else:
+            print(f"[PLAYBACK-AI] processed AI frames still not ready camera_id={int(camera_id)} device={getattr(args, 'device', '')} info={ai_wait_info}")
 
         # Publish playback_trace_* in hybrid mode: raw clean H264 frames provide
         # smooth motion at WebRTC FPS, while the latest AI metadata is overlaid

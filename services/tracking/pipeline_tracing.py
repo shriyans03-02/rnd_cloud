@@ -1253,6 +1253,16 @@ class GalleryManager:
             self.face_gallery = fg
             self.name_to_member_id = name_to_mid
             self.last_load_ts = time.time()
+        try:
+            mode_dbg = str(getattr(args, "gallery_request_mode", "location") or "location")
+            mids_dbg = list(getattr(args, "gallery_member_ids", []) or [])
+            names_dbg = list(getattr(args, "gallery_member_names", []) or [])
+            if fg is None or fg.is_empty():
+                print(f"[DB][WARN] Face gallery is empty for mode={mode_dbg} member_ids={mids_dbg} member_names={names_dbg}. Known-name playback needs face_embedding/face_embeddings_raw rows in member_embeddings.")
+            else:
+                print(f"[DB] Face gallery ready: identities={len(fg.names)} mode={mode_dbg} member_ids={mids_dbg} member_names={names_dbg}")
+        except Exception:
+            pass
 
     def maybe_reload(self, args) -> None:
         period = float(getattr(args, "db_refresh_seconds", 0.0) or 0.0)
@@ -2021,12 +2031,21 @@ class AdaptiveQueueStream:
                         kv.append((k.strip(), v.strip()))
                     else:
                         kv.append((p.strip(), ""))
+
                 def upsert(k: str, v: str) -> None:
                     for i, (kk, vv) in enumerate(kv):
                         if kk == k:
                             kv[i] = (kk, str(v))
                             return
                     kv.append((k, str(v)))
+
+                # Use FFmpeg capture options for RTSP transport instead of
+                # changing the URL. Appending '?rtsp_transport=tcp' to a
+                # MediaMTX path can make OpenCV request a different path than
+                # the one FFmpeg is publishing. That leaves playback_clean_*
+                # unopened, causing AI FPS 0 while WebRTC keeps sending black
+                # placeholder frames.
+                upsert("rtsp_transport", self.rtsp_transport)
                 if us > 0:
                     upsert("stimeout", us)
                     upsert("rw_timeout", us)
@@ -2034,13 +2053,17 @@ class AdaptiveQueueStream:
                 os.environ[key] = new_opt
             except Exception:
                 pass
+
         src_use = src
         if isinstance(src, str) and src.lower().startswith("rtsp"):
-            sep = "&" if "?" in src_use else "?"
-            src_use = f"{src_use}{sep}rtsp_transport={self.rtsp_transport}"
+            append_transport_query = str(os.environ.get("OPENCV_APPEND_RTSP_TRANSPORT_QUERY", "false")).strip().lower() in {"1", "true", "yes", "on", "y"}
+            if append_transport_query:
+                sep = "&" if "?" in src_use else "?"
+                src_use = f"{src_use}{sep}rtsp_transport={self.rtsp_transport}"
         self.src_use = src_use
         self.q: queue.Queue = queue.Queue(maxsize=self.queue_size)
         self.raw_frame_store = raw_frame_store
+        self.latest_frame_only = str(os.environ.get("PLAYBACK_DECODE_LATEST_FRAME_ONLY", os.environ.get("PLAYBACK_LATEST_FRAME_ONLY", "true"))).strip().lower() in {"1", "true", "yes", "on", "y"}
         self.stop_flag = threading.Event()
         self.dropped = 0
         self.read_dropped = 0
@@ -2050,9 +2073,12 @@ class AdaptiveQueueStream:
         self._eof = False
         self._source_fps = 0.0
         self._last_frame_mono = time.monotonic()
+        self._last_frame_wall_ts = 0.0
         self._next_reconnect_mono = 0.0
         self._reconnect_failures = 0
         self._last_log_mono = 0.0
+        self._last_error = ""
+        self._open_attempts = 0
         self._open_capture(initial=True)
         self.thread: Optional[threading.Thread] = None
         if not self.is_file_source:
@@ -2128,13 +2154,15 @@ class AdaptiveQueueStream:
         else:
             backends = [None]
         new_cap: Optional[cv2.VideoCapture] = None
+        self._open_attempts += 1
         for backend in backends:
             new_cap = self._open_once(backend)
             if new_cap is not None:
                 break
         if new_cap is None:
+            self._last_error = f"cannot open source: {self.src_use}"
             if initial:
-                self._log(f"[SRC] cannot open source initially: {self.src}")
+                self._log(f"[SRC] cannot open source initially: {self.src_use}")
             return False
         try:
             new_cap.set(cv2.CAP_PROP_BUFFERSIZE, float(self.queue_size))
@@ -2158,6 +2186,7 @@ class AdaptiveQueueStream:
             except Exception:
                 self._source_fps = 0.0
         self._last_frame_mono = time.monotonic()
+        self._last_error = ""
         self._drain_queue()
         return True
 
@@ -2237,8 +2266,11 @@ class AdaptiveQueueStream:
             if ok and frame is not None and getattr(frame, "size", 0) != 0:
                 self._last_frame_mono = now_mono
                 ts_frame = time.time()
+                self._last_frame_wall_ts = float(ts_frame)
                 self._publish_raw_frame(frame, ts_frame)
                 item = (frame, ts_frame)
+                if self.latest_frame_only:
+                    self._drain_queue()
                 try:
                     self.q.put_nowait(item)
                 except queue.Full:
@@ -2271,6 +2303,7 @@ class AdaptiveQueueStream:
         if ok and frame is not None and getattr(frame, "size", 0) != 0:
             self._last_frame_mono = time.monotonic()
             ts_frame = time.time()
+            self._last_frame_wall_ts = float(ts_frame)
             self._publish_raw_frame(frame, ts_frame)
             return True, frame, ts_frame
         with self._cap_lock:
@@ -2302,6 +2335,21 @@ class AdaptiveQueueStream:
             return int(self.q.qsize())
         except Exception:
             return 0
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "src": str(self.src),
+            "src_use": str(self.src_use),
+            "opened": bool(self.is_opened()),
+            "is_file_source": bool(self.is_file_source),
+            "queue_size": int(self.qsize()),
+            "dropped": int(getattr(self, "dropped", 0)),
+            "read_dropped": int(getattr(self, "read_dropped", 0)),
+            "open_attempts": int(getattr(self, "_open_attempts", 0)),
+            "reconnect_failures": int(getattr(self, "_reconnect_failures", 0)),
+            "last_frame_ts": float(getattr(self, "_last_frame_wall_ts", 0.0) or 0.0),
+            "last_error": str(getattr(self, "_last_error", "") or ""),
+        }
 
     def is_opened(self) -> bool:
         with self._cap_lock:
@@ -3829,6 +3877,9 @@ def parse_args(argv: Optional[List[str]] = None):
     ap.add_argument("--db-refresh-seconds", type=float, default=30.0, help="Reload DB gallery every N seconds (0=off).")
     ap.add_argument("--db-max-bank", type=int, default=0, help="Max embeddings per entry to load from *_embeddings_raw (0=all).")
     ap.add_argument("--db-include-inactive", action="store_true", help="Include inactive members.")
+    ap.add_argument("--gallery-request-mode", choices=["member", "location"], default="location", help="DB gallery filter for playback/tracing. member=only requested member IDs/names; location=all active members.")
+    ap.add_argument("--gallery-member-ids", nargs="*", type=int, default=[], help="Member IDs to load when --gallery-request-mode=member.")
+    ap.add_argument("--gallery-member-names", nargs="*", default=[], help="Member names/numbers to load when --gallery-request-mode=member.")
 
     ap.add_argument("--update-db-embeddings", action="store_true", help="Update member_embeddings face banks when face match is strong.")
     ap.add_argument("--update-face-sim-thresh", type=float, default=0.75, help="Minimum face similarity to sample embeddings for DB update.")
@@ -4527,8 +4578,11 @@ def process_one_frame(
                 color = (0, 0, 255)
             else:
                 color = (0, 255, 255)
-            show_unknown_labels = str(os.environ.get("PLAYBACK_SHOW_UNKNOWN_LABELS", "true")).strip().lower() in {"1", "true", "yes", "on", "y"}
-            label_txt = "Unknown" if show_unknown_labels else ""
+            is_playback_ctx = bool(getattr(args, "is_playback", False))
+            unknown_env_name = "PLAYBACK_SHOW_UNKNOWN_LABELS" if is_playback_ctx else "TRACKING_SHOW_UNKNOWN_LABELS"
+            unknown_default = "false" if is_playback_ctx else "true"
+            show_unknown_labels = str(os.environ.get(unknown_env_name, unknown_default)).strip().lower() in {"1", "true", "yes", "on", "y"}
+            label_txt = f"Unknown (T{int(it.tid)})" if show_unknown_labels else ""
 
         try:
             font_scale = float(os.environ.get("PLAYBACK_OVERLAY_FONT_SCALE", "0.45") or 0.45)
@@ -4612,6 +4666,30 @@ def processor_thread(
                 break
             time.sleep(0.005)
             continue
+        if bool(getattr(args, "playback_ai_read_latest_only", False)) and (not bool(getattr(vs, "is_file_source", False))):
+            # Drain already-decoded frames and keep only the newest one for AI.
+            # This prevents playback tracing from showing 1s+ AI lag while raw
+            # WebRTC motion is already current.
+            drained_latest = 0
+            try:
+                max_drain_latest = max(1, int(getattr(args, "max_drain_per_cycle", 256) or 256))
+            except Exception:
+                max_drain_latest = 256
+            while drained_latest < max_drain_latest:
+                try:
+                    if hasattr(vs, "qsize") and int(vs.qsize()) <= 0:
+                        break
+                except Exception:
+                    break
+                ok_latest, frame_latest, ts_latest = vs.read()
+                if not ok_latest or frame_latest is None:
+                    break
+                frame, ts_cap = frame_latest, ts_latest
+                try:
+                    vs.read_dropped = int(getattr(vs, "read_dropped", 0)) + 1
+                except Exception:
+                    pass
+                drained_latest += 1
         if int(args.max_queue_age_ms) > 0 and (not bool(getattr(vs, "is_file_source", False))):
             now = time.time()
             age_ms = (now - float(ts_cap)) * 1000.0
@@ -4627,11 +4705,11 @@ def processor_thread(
                 frame, ts_cap = frame2, ts2
                 age_ms = (time.time() - float(ts_cap)) * 1000.0
                 dropped_here += 1
-        # Publish the latest decoded clean frame immediately. The playback WebRTC
-        # publisher can use this raw buffer in hybrid mode to keep motion smooth
-        # while AI detection runs at its own FPS. Detection boxes from the
-        # processed buffer are overlaid on this raw stream.
-        if raw_render_store is not None:
+        # Do not overwrite the raw WebRTC buffer from the AI thread by default.
+        # AdaptiveQueueStream already publishes raw frames from its decoder thread,
+        # which is independent of YOLO speed.  Writing raw frames here re-inserts
+        # older queued/AI-paced frames and makes playback look like slow motion.
+        if raw_render_store is not None and str(os.environ.get("PLAYBACK_PROCESSOR_UPDATES_RAW_BUFFER", "false")).strip().lower() in {"1", "true", "yes", "on", "y"}:
             try:
                 raw_meta = {
                     "capture_ts": float(ts_cap or time.time()),
@@ -5314,6 +5392,12 @@ def processor_thread_with_stop(
     fps_ema = 0.0
     alpha = 0.10
     device_is_cuda = torch.cuda.is_available() and ("cuda" in str(args.device).lower())
+    last_error_log_ts = 0.0
+    consecutive_errors = 0
+    try:
+        error_log_interval = float(os.environ.get("PLAYBACK_AI_ERROR_LOG_INTERVAL_SECONDS", "2.0") or 2.0)
+    except Exception:
+        error_log_interval = 2.0
     while not stop_evt.is_set():
         ok, frame, ts_cap = vs.read()
         if not ok or frame is None:
@@ -5321,6 +5405,30 @@ def processor_thread_with_stop(
                 break
             stop_evt.wait(0.005)
             continue
+        if bool(getattr(args, "playback_ai_read_latest_only", False)) and (not bool(getattr(vs, "is_file_source", False))):
+            # Drain already-decoded frames and keep only the newest one for AI.
+            # This prevents playback tracing from showing 1s+ AI lag while raw
+            # WebRTC motion is already current.
+            drained_latest = 0
+            try:
+                max_drain_latest = max(1, int(getattr(args, "max_drain_per_cycle", 256) or 256))
+            except Exception:
+                max_drain_latest = 256
+            while drained_latest < max_drain_latest:
+                try:
+                    if hasattr(vs, "qsize") and int(vs.qsize()) <= 0:
+                        break
+                except Exception:
+                    break
+                ok_latest, frame_latest, ts_latest = vs.read()
+                if not ok_latest or frame_latest is None:
+                    break
+                frame, ts_cap = frame_latest, ts_latest
+                try:
+                    vs.read_dropped = int(getattr(vs, "read_dropped", 0)) + 1
+                except Exception:
+                    pass
+                drained_latest += 1
         if int(args.max_queue_age_ms) > 0 and (not bool(getattr(vs, "is_file_source", False))):
             now = time.time()
             age_ms = (now - float(ts_cap)) * 1000.0
@@ -5336,11 +5444,11 @@ def processor_thread_with_stop(
                 frame, ts_cap = frame2, ts2
                 age_ms = (time.time() - float(ts_cap)) * 1000.0
                 dropped_here += 1
-        # Publish the latest decoded clean frame immediately. The playback WebRTC
-        # publisher can use this raw buffer in hybrid mode to keep motion smooth
-        # while AI detection runs at its own FPS. Detection boxes from the
-        # processed buffer are overlaid on this raw stream.
-        if raw_render_store is not None:
+        # Do not overwrite the raw WebRTC buffer from the AI thread by default.
+        # AdaptiveQueueStream already publishes raw frames from its decoder thread,
+        # which is independent of YOLO speed.  Writing raw frames here re-inserts
+        # older queued/AI-paced frames and makes playback look like slow motion.
+        if raw_render_store is not None and str(os.environ.get("PLAYBACK_PROCESSOR_UPDATES_RAW_BUFFER", "false")).strip().lower() in {"1", "true", "yes", "on", "y"}:
             try:
                 raw_meta = {
                     "capture_ts": float(ts_cap or time.time()),
@@ -5410,6 +5518,7 @@ def processor_thread_with_stop(
                 "playback_hybrid_ready": True,
             })
             render_store.set(out, meta=frame_meta)
+            consecutive_errors = 0
             if save_writer is not None:
                 try:
                     save_writer.write(out)
@@ -5417,8 +5526,50 @@ def processor_thread_with_stop(
                     pass
             frame_idx += 1
         except Exception as e:
-            if debug:
-                print(f"[PROC {sid}] error:", e)
+            consecutive_errors += 1
+            now_err = time.time()
+            err_text = f"{type(e).__name__}: {e}"
+            if debug or (now_err - float(last_error_log_ts)) >= float(error_log_interval):
+                last_error_log_ts = now_err
+                print(
+                    f"[PLAYBACK-AI][src={sid} cam={camera_db_id}] processing error "
+                    f"#{consecutive_errors}: {err_text}"
+                )
+            # Do not leave the WebRTC publisher with AI FPS 0 and no useful
+            # reason. Publish a diagnostic processed frame so /active and the UI
+            # show that the AI thread is alive but failing. The service startup
+            # watchdog treats process_error=True as not ready and can fall back
+            # from CUDA to CPU automatically.
+            try:
+                diag = frame.copy() if frame is not None and getattr(frame, "size", 0) != 0 else np.zeros((720, 1280, 3), dtype=np.uint8)
+                h, w = diag.shape[:2]
+                msg = ("AI processing error: " + err_text)[:120]
+                cv2.rectangle(diag, (0, 0), (min(w - 1, 980), 72), (0, 0, 0), -1)
+                cv2.putText(diag, msg, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
+                cv2.putText(diag, "Raw playback is connected; detection runner will fall back/retry", (12, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
+                render_store.set(diag, meta={
+                    "fps": 0.0,
+                    "ai_fps": 0.0,
+                    "tracks": 0,
+                    "shown": 0,
+                    "faces_recognized": 0,
+                    "events": [],
+                    "present_names": [],
+                    "present_conf": {},
+                    "sid": int(sid),
+                    "camera_db_id": int(camera_db_id),
+                    "frame_idx": int(frame_idx),
+                    "capture_ts": float(ts_cap or time.time()),
+                    "processed_size": [int(w), int(h)],
+                    "frame_size": [int(w), int(h)],
+                    "frame_width": int(w),
+                    "frame_height": int(h),
+                    "source_size": [int(frame.shape[1]), int(frame.shape[0])] if frame is not None and getattr(frame, "size", 0) != 0 else [int(w), int(h)],
+                    "process_error": True,
+                    "ai_error": err_text,
+                })
+            except Exception:
+                pass
             stop_evt.wait(0.001)
 
 
@@ -5822,11 +5973,27 @@ class TrackingRunner:
 
     def status(self) -> Dict[str, Any]:
         cams = sorted(list(self._render_by_cam.keys()))
+        source_status = []
+        for s in list(getattr(self, "_streams", []) or []):
+            vs = s.get("vs")
+            try:
+                if hasattr(vs, "status"):
+                    st = dict(vs.status())
+                else:
+                    st = {"opened": bool(getattr(vs, "is_opened", lambda: False)())}
+            except Exception as exc:
+                st = {"opened": False, "last_error": str(exc)}
+            st.update({
+                "sid": int(s.get("sid", -1)),
+                "camera_db_id": int(s.get("camera_db_id", -1)),
+            })
+            source_status.append(st)
         return {
             "running": bool(self._started),
             "camera_ids": cams,
             "num_cameras": len(cams),
             "raw_camera_ids": sorted(list(self._raw_render_by_cam.keys())),
+            "sources": source_status,
             "save_csv": bool(getattr(self.args, "save_csv", False)),
             "csv_path": str(getattr(self.args, "csv", "") or ""),
             "write_normalized_data": bool(self._normalized_data_writer is not None),
@@ -6648,7 +6815,10 @@ def process_one_frame(
             )
         else:
             color = (0, 255, 255)
-            show_unknown_labels = str(os.environ.get("PLAYBACK_SHOW_UNKNOWN_LABELS", "true")).strip().lower() in {"1", "true", "yes", "on", "y"}
+            is_playback_ctx = bool(getattr(args, "is_playback", False))
+            unknown_env_name = "PLAYBACK_SHOW_UNKNOWN_LABELS" if is_playback_ctx else "TRACKING_SHOW_UNKNOWN_LABELS"
+            unknown_default = "false" if is_playback_ctx else "true"
+            show_unknown_labels = str(os.environ.get(unknown_env_name, unknown_default)).strip().lower() in {"1", "true", "yes", "on", "y"}
             label_txt = f"Unknown (T{show_raw_tid})" if show_unknown_labels else ""
 
         try:

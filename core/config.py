@@ -130,6 +130,13 @@ class Settings(BaseSettings):
     TRACKING_WEBRTC_DRAW_STATS: bool = True
     TRACKING_WEBRTC_LOG_DIR: str = "logs/ffmpeg_webrtc"
     TRACKING_WEBRTC_BOOTSTRAP_PLACEHOLDER: bool = True
+
+    # Live unknown-box visibility.  Defaults keep live monitoring behavior unchanged:
+    # known + unknown boxes are visible, with yellow Unknown labels.
+    # To hide unknown boxes only in live streams, set TRACKING_HIDE_UNKNOWN=True.
+    TRACKING_HIDE_UNKNOWN: bool = False
+    TRACKING_SHOW_UNKNOWN_LABELS: bool = True
+
     # Do not start one FFmpeg encoder per camera at backend startup.  Publishers
     # are started on demand when /v1/tracking/webrtc/{camera_id} is requested.
     # This is important for 12+ cameras on A100 because A100 has no NVENC;
@@ -148,10 +155,24 @@ class Settings(BaseSettings):
     PLAYBACK_HALF: bool = True
     PLAYBACK_CUDNN_BENCHMARK: bool = True
     PLAYBACK_TRACKER_BACKEND: str = "iou"  # iou, bytetrack, deepsort, strongsort
-    PLAYBACK_USE_FACE: bool = False
+    # Playback identity matching.  PLAYBACK_IDENTITY_MATCHING_ENABLED=True
+    # means annotated playback uses DB face embeddings: member requests load only
+    # the requested member; location requests load all active members.
+    PLAYBACK_IDENTITY_MATCHING_ENABLED: bool = True
+    PLAYBACK_FORCE_FACE_FOR_IDENTITY: bool = True
+    PLAYBACK_USE_FACE: bool = True
     PLAYBACK_FACE_PROVIDER: str = "cpu"  # cpu is safest while live CUDA pipeline is running
     PLAYBACK_FACE_DET_SIZE: str = "640 640"
-    PLAYBACK_FACE_EVERY_N: int = 5
+    PLAYBACK_FACE_EVERY_N: int = 10
+    PLAYBACK_MEMBER_FACE_EVERY_N: int = 5
+    PLAYBACK_LOCATION_FACE_EVERY_N: int = 10
+    PLAYBACK_FACE_THRESH: float = 0.45
+    PLAYBACK_FACE_GAP: float = 0.03
+    PLAYBACK_FACE_STRONG_THRESH: float = 0.55
+    PLAYBACK_MIN_FACE_DET_SCORE: float = 0.45
+    PLAYBACK_MIN_FACE_PX: int = 18
+    PLAYBACK_MIN_FACE_AREA_RATIO: float = 0.003
+    PLAYBACK_FACE_IOU_LINK: float = 0.25
     PLAYBACK_VIDEO_FPS: float = 20.0
     # When True, playback behaves like a player: if AI cannot process every
     # frame, stale decoded frames are skipped so the clip does not run in slow
@@ -159,13 +180,24 @@ class Settings(BaseSettings):
     # decoded frames here does not break HEVC/H264 reference chains.
     PLAYBACK_REALTIME_MODE: bool = True
     PLAYBACK_KEEP_ALL_FRAMES: bool = False
-    PLAYBACK_QUEUE_SIZE: int = 8
-    PLAYBACK_MAX_QUEUE_AGE_MS: int = 600
-    PLAYBACK_MAX_DRAIN_PER_CYCLE: int = 128
+    PLAYBACK_QUEUE_SIZE: int = 2
+    PLAYBACK_MAX_QUEUE_AGE_MS: int = 300
+    PLAYBACK_MAX_DRAIN_PER_CYCLE: int = 512
+    PLAYBACK_AI_READ_LATEST_ONLY: bool = True
+    PLAYBACK_DECODE_LATEST_FRAME_ONLY: bool = True
+    PLAYBACK_HIDE_UNKNOWN: bool = True
     PLAYBACK_STREAM_FREEZE_SECONDS: float = 300.0
     PLAYBACK_STREAM_OPEN_TIMEOUT_MS: int = 8000
     PLAYBACK_STREAM_READ_TIMEOUT_MS: int = 8000
     PLAYBACK_MAX_ACTIVE_SESSIONS: int = 1
+    # Wait for actual decoded/AI frames before returning a playback session.
+    # If CUDA playback AI does not produce frames, automatically restart only
+    # the playback AI runner on CPU while keeping the clean restream/WebRTC path alive.
+    PLAYBACK_WAIT_FOR_RAW_SECONDS: float = 30.0
+    PLAYBACK_WAIT_FOR_AI_SECONDS: float = 10.0
+    PLAYBACK_AI_FALLBACK_ON_TIMEOUT: bool = True
+    PLAYBACK_AI_FALLBACK_DEVICE: str = "cpu"
+    PLAYBACK_AI_ERROR_LOG_INTERVAL_SECONDS: float = 2.0
     # Playback publisher smoothing. Keep MediaMTX path alive but do not flash
     # black placeholder frames between decoded/annotated frames.
     PLAYBACK_HOLD_LAST_FRAME: bool = True
@@ -204,14 +236,15 @@ class Settings(BaseSettings):
     PLAYBACK_CLEAN_RESTREAM_LOG_DIR: str = "logs/playback_clean_restream"
     PLAYBACK_CLEAN_RESTREAM_PATH_PREFIX: str = "playback_clean_"
     PLAYBACK_CLEAN_RESTREAM_WARMUP_SECONDS: float = 2.0
-    PLAYBACK_CLEAN_RESTREAM_FFMPEG_FLAGS: str = "-fflags +genpts+discardcorrupt -err_detect ignore_err -analyzeduration 10000000 -probesize 10000000 -max_delay 5000000"
+    PLAYBACK_CLEAN_RESTREAM_FFMPEG_FLAGS: str = "-fflags +genpts -flags2 +showall -err_detect ignore_err -analyzeduration 10000000 -probesize 10000000 -max_delay 5000000"
+    PLAYBACK_CLEAN_RESTREAM_FORCE_FPS_FILTER: bool = False
 
     # Optional playback overlay tuning used by patched pipeline_tracing draw paths.
     PLAYBACK_OVERLAY_FONT_SCALE: float = 0.45
     PLAYBACK_OVERLAY_THICKNESS: int = 1
     PLAYBACK_OVERLAY_LABEL_MAX_CHARS: int = 24
     PLAYBACK_SHOW_TRACK_ID: bool = True
-    PLAYBACK_SHOW_UNKNOWN_LABELS: bool = True
+    PLAYBACK_SHOW_UNKNOWN_LABELS: bool = False
 
     # Camera channel map, e.g. "11:101,12:301,10:201,9:401"
     CHANNEL_MAP: str = ""

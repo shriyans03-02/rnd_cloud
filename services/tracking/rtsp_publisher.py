@@ -33,6 +33,13 @@ class ProcessedFrameRtspPublisher:
     _encoder_cache: Dict[Tuple[str, str], bool] = {}
     _encoder_cache_lock = threading.Lock()
 
+    @staticmethod
+    def _env_bool(name: str, default: bool = False) -> bool:
+        raw = os.environ.get(str(name))
+        if raw is None or str(raw).strip() == "":
+            return bool(default)
+        return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+
     def __init__(
         self,
         *,
@@ -64,6 +71,8 @@ class ProcessedFrameRtspPublisher:
         self.mode = str(mode or "hybrid").strip().lower()
         if self.mode not in {"hybrid", "processed"}:
             self.mode = "hybrid"
+        self.is_playback_stream = self.stream_name.startswith("playback_trace_") or self.stream_name.startswith("playback_")
+        self._visibility_prefix = "PLAYBACK" if self.is_playback_stream else "TRACKING"
         self.fps = float(max(1.0, min(30.0, float(fps or 15.0))))
         self.width = int(width or 0)
         self.height = int(height or 0)
@@ -72,6 +81,21 @@ class ProcessedFrameRtspPublisher:
         self.bufsize = str(bufsize or "700k").strip()
         self.x264_preset = str(x264_preset or "superfast").strip()
         self.overlay_max_age_ms = int(max(0, int(overlay_max_age_ms or 0)))
+        if self.is_playback_stream:
+            self.force_raw_motion = self._env_bool("PLAYBACK_FORCE_RAW_MOTION", True)
+            self.disable_processed_fallback = self._env_bool("PLAYBACK_DISABLE_PROCESSED_FALLBACK", True)
+            self.hide_unknown_overlay = self._env_bool("PLAYBACK_HIDE_UNKNOWN", True)
+            self.show_unknown_labels = self._env_bool("PLAYBACK_SHOW_UNKNOWN_LABELS", False)
+        else:
+            # Live streams: keep unknown people visible by default.  Operators can
+            # hide live unknowns without changing playback by setting:
+            #   TRACKING_HIDE_UNKNOWN=True
+            # They can also keep boxes but suppress the text label with:
+            #   TRACKING_SHOW_UNKNOWN_LABELS=False
+            self.force_raw_motion = self._env_bool("TRACKING_FORCE_RAW_MOTION", False)
+            self.disable_processed_fallback = self._env_bool("TRACKING_DISABLE_PROCESSED_FALLBACK", False)
+            self.hide_unknown_overlay = self._env_bool("TRACKING_HIDE_UNKNOWN", False)
+            self.show_unknown_labels = self._env_bool("TRACKING_SHOW_UNKNOWN_LABELS", True)
         self.gop = int(max(1, int(gop or round(self.fps))))
         self.draw_stats = bool(draw_stats)
         self.log_dir = str(log_dir or "logs/ffmpeg_webrtc")
@@ -90,6 +114,7 @@ class ProcessedFrameRtspPublisher:
         self._latest_processed_frame: Optional[np.ndarray] = None
         self._latest_raw_frame: Optional[np.ndarray] = None
         self._latest_meta: Dict[str, Any] = {}
+        self._latest_raw_meta: Dict[str, Any] = {}
         self._latest_processed_arrival_ts: float = 0.0
         self._latest_raw_arrival_ts: float = 0.0
 
@@ -105,6 +130,8 @@ class ProcessedFrameRtspPublisher:
         self._last_frame_ts: float = 0.0
         self._last_publish_ts: float = 0.0
         self._publish_fps_ema: float = 0.0
+        self._raw_fps_ema: float = 0.0
+        self._last_raw_fps_ts: float = 0.0
         self._last_cmd: list[str] = []
         self._active_codec: str = ""
         self._forced_codec: str = ""
@@ -585,10 +612,21 @@ class ProcessedFrameRtspPublisher:
             pipe_fps = float((meta or {}).get("fps") or 0.0)
             shown = int((meta or {}).get("shown") or 0)
             tracks = int((meta or {}).get("tracks") or 0)
-            lag_ms = 0.0
+            now_wall = time.time()
+            ai_lag_ms = 0.0
+            raw_lag_ms = 0.0
             cap_ts = float((meta or {}).get("capture_ts") or 0.0)
             if cap_ts > 0:
-                lag_ms = max(0.0, (time.time() - cap_ts) * 1000.0)
+                ai_lag_ms = max(0.0, (now_wall - cap_ts) * 1000.0)
+            raw_cap_ts = 0.0
+            try:
+                raw_cap_ts = float((self._latest_raw_meta or {}).get("capture_ts") or 0.0)
+            except Exception:
+                raw_cap_ts = 0.0
+            if raw_cap_ts > 0:
+                raw_lag_ms = max(0.0, (now_wall - raw_cap_ts) * 1000.0)
+            elif cap_ts > 0:
+                raw_lag_ms = ai_lag_ms
 
             webrtc_fps = float(self._publish_fps_ema or self.fps)
             timings = (meta or {}).get("timings_ms") or {}
@@ -608,9 +646,10 @@ class ProcessedFrameRtspPublisher:
                 ss_txt = f"BT+ReID {('hit' if hy_used else 'skip')} {hy_reason} lost={hy_lost}".strip()
             else:
                 ss_txt = f"SS {('hit' if ss_used else 'skip')}/{ss_every}" if ss_every > 1 else ("SS" if ss_used else "trk")
+            raw_fps = float(self._raw_fps_ema or 0.0)
             lines = [
-                f"AI FPS {pipe_fps:.1f} | WebRTC FPS {webrtc_fps:.1f} | {source}",
-                f"tracks {tracks} | shown {shown} | lag {lag_ms:.0f}ms",
+                f"AI FPS {pipe_fps:.1f} | Raw FPS {raw_fps:.1f} | WebRTC FPS {webrtc_fps:.1f} | {source}",
+                f"tracks {tracks} | shown {shown} | raw lag {raw_lag_ms:.0f}ms | AI lag {ai_lag_ms:.0f}ms",
                 f"yolo {yolo_ms:.0f}ms | trk {trk_ms:.0f}ms | total {total_ms:.0f}ms | {ss_txt}",
             ]
             font = cv2.FONT_HERSHEY_SIMPLEX
@@ -670,6 +709,8 @@ class ProcessedFrameRtspPublisher:
             if parsed is None:
                 continue
             x1, y1, x2, y2, label, is_known = parsed
+            if self.hide_unknown_overlay and not bool(is_known):
+                continue
             xx1 = int(max(0, min(out_w - 1, round(float(x1) * sx))))
             yy1 = int(max(0, min(out_h - 1, round(float(y1) * sy))))
             xx2 = int(max(0, min(out_w - 1, round(float(x2) * sx))))
@@ -677,18 +718,22 @@ class ProcessedFrameRtspPublisher:
             if xx2 <= xx1 or yy2 <= yy1:
                 continue
             color = (0, 255, 0) if bool(is_known) else (0, 255, 255)
-            label = str(label or "Unknown")
+            if bool(is_known):
+                label = str(label or "").strip()
+            else:
+                label = str(label or "Unknown").strip() if self.show_unknown_labels else ""
             cv2.rectangle(frame, (xx1, yy1), (xx2, yy2), color, thickness)
-            (tw, th), _ = cv2.getTextSize(label, font, scale, label_thickness)
-            y_text = max(th + 4, yy1 - 6)
-            cv2.rectangle(
-                frame,
-                (xx1, max(0, y_text - th - 5)),
-                (min(out_w - 1, xx1 + tw + 6), min(out_h - 1, y_text + 4)),
-                (0, 0, 0),
-                -1,
-            )
-            cv2.putText(frame, label, (xx1 + 3, y_text), font, scale, color, label_thickness, cv2.LINE_AA)
+            if label:
+                (tw, th), _ = cv2.getTextSize(label, font, scale, label_thickness)
+                y_text = max(th + 4, yy1 - 6)
+                cv2.rectangle(
+                    frame,
+                    (xx1, max(0, y_text - th - 5)),
+                    (min(out_w - 1, xx1 + tw + 6), min(out_h - 1, y_text + 4)),
+                    (0, 0, 0),
+                    -1,
+                )
+                cv2.putText(frame, label, (xx1 + 3, y_text), font, scale, color, label_thickness, cv2.LINE_AA)
             drew = True
         return bool(drew)
 
@@ -723,7 +768,7 @@ class ProcessedFrameRtspPublisher:
         if self.raw_buffer is None:
             return
         try:
-            frame, ts, _meta, seq = self._poll_buffer(self.raw_buffer, self._last_raw_seq, timeout=timeout)
+            frame, ts, raw_meta, seq = self._poll_buffer(self.raw_buffer, self._last_raw_seq, timeout=timeout)
         except Exception as exc:
             self._last_error = f"raw buffer read failed: {exc}"
             return
@@ -732,7 +777,15 @@ class ProcessedFrameRtspPublisher:
         self._last_raw_seq = int(seq)
         if frame is not None and getattr(frame, "size", 0) != 0:
             self._latest_raw_frame = frame
-            self._latest_raw_arrival_ts = float(ts or time.time())
+            self._latest_raw_meta = dict(raw_meta or {})
+            now_raw = time.time()
+            self._latest_raw_arrival_ts = float(ts or now_raw)
+            if self._last_raw_fps_ts > 0.0:
+                dt_raw = max(1e-6, now_raw - float(self._last_raw_fps_ts))
+                inst_raw_fps = 1.0 / dt_raw
+                alpha = 0.15
+                self._raw_fps_ema = inst_raw_fps if self._raw_fps_ema <= 0.0 else ((1.0 - alpha) * self._raw_fps_ema + alpha * inst_raw_fps)
+            self._last_raw_fps_ts = now_raw
 
     def _make_output_frame(self) -> Tuple[np.ndarray, str]:
         bootstrap_w = int(self.width or 1280)
@@ -747,18 +800,20 @@ class ProcessedFrameRtspPublisher:
                     self._draw_stats_overlay(out, self._latest_meta, source="overlay")
                     return out, "overlay"
 
-                # Safety fallback: never let WebRTC look permanently like the
-                # raw MediaMTX camera feed after detections have started.  If
-                # overlay metadata is missing/stale but the latest processed
-                # frame contains drawn boxes, publish that annotated frame.
-                try:
-                    has_drawn_boxes = int((self._latest_meta or {}).get("shown") or 0) > 0
-                except Exception:
-                    has_drawn_boxes = False
-                if has_drawn_boxes and self._latest_processed_frame is not None:
-                    out = self._latest_processed_frame.copy()
-                    self._draw_stats_overlay(out, self._latest_meta, source="processed")
-                    return out, "processed"
+                # Prefer raw motion over stale processed frames. The previous
+                # processed-frame fallback repeated old AI frames whenever the
+                # overlay was stale, so WebRTC reported 20 FPS while the picture
+                # looked like slow motion. Keep the clean raw stream moving; draw
+                # boxes only when metadata is fresh.
+                if (not self.disable_processed_fallback) and (not self.force_raw_motion):
+                    try:
+                        has_drawn_boxes = int((self._latest_meta or {}).get("shown") or 0) > 0
+                    except Exception:
+                        has_drawn_boxes = False
+                    if has_drawn_boxes and self._latest_processed_frame is not None:
+                        out = self._latest_processed_frame.copy()
+                        self._draw_stats_overlay(out, self._latest_meta, source="processed")
+                        return out, "processed"
 
                 self._draw_stats_overlay(out, self._latest_meta, source="raw")
                 return out, "raw"
@@ -859,6 +914,12 @@ class ProcessedFrameRtspPublisher:
             "path_ready": bool(self._ready_evt.is_set()),
             "video_ready": bool(self._real_frames_published > 0),
             "raw_motion_ready": bool(self._raw_frames_published > 0),
+            "raw_fps": float(self._raw_fps_ema or 0.0),
+            "force_raw_motion": bool(self.force_raw_motion),
+            "disable_processed_fallback": bool(self.disable_processed_fallback),
+            "hide_unknown_overlay": bool(self.hide_unknown_overlay),
+            "show_unknown_labels": bool(getattr(self, "show_unknown_labels", True)),
+            "visibility_prefix": str(getattr(self, "_visibility_prefix", "")),
             "processed_ready": bool(self._latest_processed_arrival_ts > 0),
             "overlay_ready": bool(self._overlay_frames_published > 0),
             "alive": self.is_alive(),

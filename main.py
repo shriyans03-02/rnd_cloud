@@ -3,12 +3,14 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import os
-# Do not force CUDA_LAUNCH_BLOCKING in production.  That flag is for debugging
-# and serializes CUDA kernels.  Set PIPELINE_CUDA_DEBUG_SYNC=1 only when chasing
-# a device-side CUDA fault.
-if str(os.environ.get("PIPELINE_CUDA_DEBUG_SYNC", "0")).strip().lower() in {"1", "true", "yes", "on"}:
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-os.environ.setdefault("TORCH_CUDAGRAPH_ENABLE", "0")
+# Force synchronous execution to prevent thread race conditions on the GPU
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+# Disable implicit torch backend graph profiling
+os.environ["TORCH_CUDAGRAPH_ENABLE"] = "0"
+
+import torch
+# Disable PyTorch's internal benchmarking allocator which breaks multi-threading
+torch.backends.cudnn.benchmark = False
 
 class NormalizeDuplicateV1Middleware:
     """Normalize accidental duplicate API prefixes from the frontend.
@@ -47,7 +49,7 @@ app.add_middleware(NormalizeDuplicateV1Middleware)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "https://cbt-reid-admin-ui.onrender.com"],
+    allow_origins=["http://100.111.17.5:5173", "https://cbt-reid-admin-ui.onrender.com","http://164.52.214.233:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

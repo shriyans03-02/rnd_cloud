@@ -31,14 +31,14 @@ def _quote_yaml(value: str) -> str:
 
 
 def build_camera_rtsp_url(ip: str) -> str:
-    template = _env("RTSP_URL_TEMPLATE", "rtsp://{username}:{password}@{ip}:{port}/video/live?channel={channel}&subtype={subtype}")
+    template = _env("RTSP_URL_TEMPLATE", "rtsp://{username}:{password}@{ip}:{port}/cam/realmonitor?channel={channel}&subtype={subtype}")
     vals = {
         "scheme": _env("RTSP_SCHEME", "rtsp"),
         "username": _env("RTSP_USERNAME", "") or _env("RTSP_USER", "admin"),
         "password": _env("RTSP_PASSWORD", "") or _env("RTSP_PASS", ""),
         "ip": str(ip or "").strip(),
         "port": _env("RTSP_PORT", "554"),
-        "path": _env("RTSP_PATH", "/video/live"),
+        "path": _env("RTSP_PATH", "/cam/realmonitor"),
         "channel": _env("RTSP_CHANNEL", "1"),
         "subtype": _env("RTSP_SUBTYPE", "0"),
         "stream": _env("RTSP_STREAM", ""),

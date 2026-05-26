@@ -13,10 +13,10 @@ class Settings(BaseSettings):
     # Your .env currently uses lowercase pipeline_args.
     pipeline_args: str = Field(default="")
 
-    # RTSP config for this camera URL format:
-    # rtsp://admin:Admin%40123@192.168.1.161:554/video/live?channel=1&subtype=0
+    # RTSP config for CP Plus / Dahua live stream format:
+    # rtsp://admin:admin%40123@10.10.43.251:554/cam/realmonitor?channel=1&subtype=0
     RTSP_USER: str = "admin"
-    RTSP_PASS: str = "Admin%40123"
+    RTSP_PASS: str = "admin%40123"
 
     # Optional aliases supported by embedding_service.py.
     # If these are set, they override RTSP_USER / RTSP_PASS in embedding_service.py.
@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     RTSP_PASSWORD: str = ""
 
     RTSP_PORT: str = "554"
-    RTSP_PATH: str = "/video/live"
+    RTSP_PATH: str = "/cam/realmonitor"
     RTSP_SCHEME: str = "rtsp"
     RTSP_STREAM: str = ""
 
@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     RTSP_SUBTYPE: str = "0"
 
     RTSP_URL_TEMPLATE: str = (
-        "rtsp://{username}:{password}@{ip}:{port}/video/live"
+        "rtsp://{username}:{password}@{ip}:{port}/cam/realmonitor"
         "?channel={channel}&subtype={subtype}"
     )
 
@@ -136,6 +136,13 @@ class Settings(BaseSettings):
     # To hide unknown boxes only in live streams, set TRACKING_HIDE_UNKNOWN=True.
     TRACKING_HIDE_UNKNOWN: bool = False
     TRACKING_SHOW_UNKNOWN_LABELS: bool = True
+
+    # Embedding extraction UI preview. The backend publishes detected frames via
+    # /api/v1/embeddings/preview and /api/v1/embeddings/preview.jpg instead of
+    # opening a local cv2.imshow window on the server.
+    EMBEDDING_PREVIEW_FPS: float = 8.0
+    EMBEDDING_PREVIEW_JPEG_QUALITY: int = 80
+    EMBEDDING_ENABLE_CV2_VIEWER: bool = False
 
     # Do not start one FFmpeg encoder per camera at backend startup.  Publishers
     # are started on demand when /v1/tracking/webrtc/{camera_id} is requested.

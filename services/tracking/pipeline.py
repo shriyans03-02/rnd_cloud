@@ -8576,14 +8576,14 @@ def _env_first(*names: str, default: str = "") -> str:
 def _build_direct_rtsp_url_from_ip(ip: str) -> str:
     template = _env_first(
         "RTSP_URL_TEMPLATE",
-        default="rtsp://{username}:{password}@{ip}:{port}/video/live?channel={channel}&subtype={subtype}",
+        default="rtsp://{username}:{password}@{ip}:{port}/cam/realmonitor?channel={channel}&subtype={subtype}",
     )
     vals = {
         "ip": str(ip),
         "username": _env_first("RTSP_USER", default="admin"),
         "password": _env_first("RTSP_PASS", default=""),
         "port": _env_first("RTSP_PORT", default="554"),
-        "path": _env_first("RTSP_PATH", default="/video/live"),
+        "path": _env_first("RTSP_PATH", default="/cam/realmonitor"),
         "channel": _env_first("RTSP_CHANNEL", default="1"),
         "subtype": _env_first("RTSP_SUBTYPE", default="0"),
         "stream": _env_first("RTSP_STREAM", default=""),

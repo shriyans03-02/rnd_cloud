@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel, Field, conint
 from typing import Optional, List, Dict, Any
+from fastapi.responses import StreamingResponse, Response
 from app.services import embedding_service
 from app.schemas import embedding
 from app.core.dependencies import get_current_user
@@ -116,6 +117,39 @@ def remove(
     if isinstance(res, dict) and res.get("status") == "error":
         raise HTTPException(status_code=400, detail=res.get("message", "unknown error"))
     return res if isinstance(res, dict) else {"status": "ok", "member_id": member_id, "camera_id": camera_id}
+
+
+@router.get("/preview.jpg")
+def preview_jpeg(
+    camera_id: Optional[int] = Query(None, description="Camera ID to preview. If omitted, first active preview frame is returned."),
+    jpeg_quality: int = Query(80, ge=30, le=95),
+    current_user: User = Depends(get_current_user),
+):
+    """Latest embedding extraction preview frame as a JPEG.
+
+    The frontend polls this endpoint with axios so the Authorization header is
+    preserved.  It shows the detected/captured frame in the UI instead of using
+    server-side cv2.imshow.
+    """
+    jpg = embedding_service.get_preview_jpeg(camera_id=camera_id, jpeg_quality=jpeg_quality)
+    if jpg is None:
+        raise HTTPException(status_code=404, detail="No embedding preview frame available yet")
+    return Response(content=jpg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@router.get("/preview")
+def preview_stream(
+    camera_id: Optional[int] = Query(None, description="Camera ID to preview. If omitted, first active preview frame is streamed."),
+    max_fps: int = Query(8, ge=1, le=20),
+    jpeg_quality: int = Query(80, ge=30, le=95),
+    current_user: User = Depends(get_current_user),
+):
+    """MJPEG preview stream for embedding extraction."""
+    return StreamingResponse(
+        embedding_service.embedding_preview_mjpeg_generator(camera_id=camera_id, max_fps=max_fps, jpeg_quality=jpeg_quality),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.get("/status", response_model=Dict[str, Any])

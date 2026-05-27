@@ -16,6 +16,7 @@ import numpy as np
 
 from app.core.config import settings
 from app.services.tracking.rtsp_publisher import ProcessedFrameRtspPublisher
+from app.services.tracking.worker_sharding import list_active_db_cameras
 
 # Regular live pipeline (continuous multi-camera tracking). This remains
 # separate from playback tracing.
@@ -54,6 +55,8 @@ class DetectionService:
         self._runner: LiveTrackingRunner | None = None
         self._publishers: Dict[int, ProcessedFrameRtspPublisher] = {}
         self._publishers_lock = threading.Lock()
+        self._external_workers = self._env_bool("TRACKING_EXTERNAL_WORKERS", False) or (not self._env_bool("TRACKING_IN_API", True))
+        self._remote_started = False
 
         if isinstance(pipeline_args, argparse.Namespace):
             self._args: argparse.Namespace | None = pipeline_args
@@ -76,6 +79,12 @@ class DetectionService:
 
         self._apply_live_visibility_overrides(args)
 
+        if self._external_workers:
+            self._args = args
+            self._remote_started = True
+            print("[INIT] Live AI runs in external ai_worker.py processes; FastAPI will expose DB/MediaMTX WebRTC URLs only.")
+            return
+
         self._runner = LiveTrackingRunner(args)
         try:
             self._runner.start()
@@ -87,7 +96,7 @@ class DetectionService:
                 except Exception:
                     cam_count = 0
                 print(f"[INIT] Processed WebRTC publishers: lazy/on-demand (active cameras={cam_count}). First /v1/tracking/webrtc/<camera_id> request starts that camera publisher.")
-        except Exception:
+        except Exception as exc:
             try:
                 self.stop_processed_publishers()
             except Exception:
@@ -97,6 +106,16 @@ class DetectionService:
             except Exception:
                 pass
             self._runner = None
+            msg = str(exc)
+            soft_start = self._env_bool("TRACKING_SOFT_START", True) or self._env_bool("TRACKING_ALLOW_EMPTY_SOURCES", True)
+            camera_startup_error = (
+                "No sources opened" in msg
+                or "No active DB cameras" in msg
+                or "No camera sources configured" in msg
+            )
+            if soft_start and camera_startup_error:
+                print(f"[WARN] Live tracking disabled for startup, but API will continue: {msg}")
+                return
             raise
 
     @staticmethod
@@ -122,6 +141,35 @@ class DetectionService:
             pass
         # Keep tracker IDs visible in live unless explicitly disabled by normal
         # pipeline args.  Unknown labels are handled by the publisher/draw code.
+
+    def _current_args(self) -> argparse.Namespace:
+        if self._args is not None:
+            args = self._args
+        else:
+            args = live_parse_pipeline_args(self._pipeline_args_str)
+            if not getattr(args, "db_url", ""):
+                args.db_url = os.environ.get("DATABASE_URL", "") or ""
+            self._args = args
+        return args
+
+    def _db_camera_rows(self, cam_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+        args = self._current_args()
+        selected = set(int(x) for x in (cam_ids or []) if int(x) > 0)
+        cams = list_active_db_cameras(str(getattr(args, "db_url", "") or os.environ.get("DATABASE_URL", "")), selected_ids=selected or None)
+        out: List[Dict[str, Any]] = []
+        for c in cams:
+            out.append({
+                "id": int(c.id),
+                "camera_id": int(c.id),
+                "name": str(c.name or f"Camera {int(c.id)}"),
+                "ip_address": str(c.ip_address or ""),
+                "running": bool(self._external_workers),
+                "external_worker": bool(self._external_workers),
+            })
+        if not out and selected:
+            for cid in sorted(selected):
+                out.append({"id": int(cid), "camera_id": int(cid), "name": f"Camera {int(cid)}", "ip_address": "", "running": False, "external_worker": bool(self._external_workers)})
+        return out
 
     @staticmethod
     def _live_stream_name(camera_id: int) -> str:
@@ -293,6 +341,9 @@ class DetectionService:
                 print(f"[WARN] Could not start processed WebRTC publisher camera_id={cam_id}: {exc}")
 
     def restart_processed_publishers(self) -> None:
+        if self._external_workers:
+            print("[WEBRTC] restart requested in external-worker mode; publishers are owned by ai_worker.py processes.")
+            return
         if self._runner is None:
             self.start()
             return
@@ -320,21 +371,39 @@ class DetectionService:
             self._runner = None
 
     def get_camera_buffer(self, cam_id: int) -> Optional[LiveRenderedFrame]:
+        if self._external_workers:
+            return None
         if self._runner is None:
             self.start()
-        assert self._runner is not None
+        if self._runner is None:
+            return None
         return self._runner.get_camera_buffer(int(cam_id))
 
     def get_camera_raw_buffer(self, cam_id: int) -> Optional[LiveRenderedFrame]:
+        if self._external_workers:
+            return None
         if self._runner is None:
             self.start()
-        assert self._runner is not None
+        if self._runner is None:
+            return None
         return self._runner.get_camera_raw_buffer(int(cam_id))
 
     def list_cameras(self) -> List[Dict[str, Any]]:
+        if self._external_workers:
+            out = self._db_camera_rows()
+            streams = {int(x.get("camera_id")): x for x in self.get_webrtc_streams()}
+            for cam in out:
+                try:
+                    cam_id = int(cam.get("camera_id") or cam.get("id"))
+                    if cam_id in streams:
+                        cam.update(streams[cam_id])
+                except Exception:
+                    pass
+            return out
         if self._runner is None:
             self.start()
-        assert self._runner is not None
+        if self._runner is None:
+            return []
         out = self._runner.list_db_cameras(active_only=True)
         streams = {int(x.get("camera_id")): x for x in self.get_webrtc_streams()}
         for cam in out:
@@ -351,9 +420,37 @@ class DetectionService:
         cam_ids: Optional[List[int]] = None,
         public_base: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
+        if self._external_workers:
+            rows = self._db_camera_rows(cam_ids=cam_ids)
+            active_ids = {int(x.get("camera_id") or x.get("id")) for x in rows}
+            if cam_ids is None:
+                cam_ids = sorted(active_ids)
+            out: List[Dict[str, Any]] = []
+            for cam_id in sorted(set(int(x) for x in (cam_ids or []))):
+                stream_name = self._live_stream_name(int(cam_id))
+                info: Dict[str, Any] = {
+                    "camera_id": int(cam_id),
+                    "stream_name": stream_name,
+                    "rtsp_publish_url": f"{str(getattr(settings, 'MEDIAMTX_RTSP', '')).rstrip('/')}/{stream_name}",
+                    "webrtc_enabled": bool(getattr(settings, "TRACKING_WEBRTC_ENABLED", True)),
+                    **self._webrtc_urls(stream_name, public_base=public_base),
+                    "active_in_pipeline": int(cam_id) in active_ids,
+                    "external_worker": True,
+                    "publisher_ready": True,
+                    "processed_frames_ready": False,
+                    "raw_motion_ready": False,
+                    "overlay_ready": False,
+                    "publisher_alive": None,
+                    "available": True,
+                    "status_reason": "external_ai_worker_expected_on_mediamtx_path",
+                    "publisher": None,
+                }
+                out.append(info)
+            return out
         if self._runner is None:
             self.start()
-        assert self._runner is not None
+        if self._runner is None:
+            return []
 
         try:
             active_ids = {int(x) for x in (self._runner.status().get("camera_ids") or [])}
@@ -412,25 +509,41 @@ class DetectionService:
     def get_webrtc_stream(self, cam_id: int, public_base: Optional[str] = None) -> Dict[str, Any]:
         # Start the FFmpeg/MediaMTX publisher lazily for exactly the camera the UI opened.
         # This avoids running 12+ CPU encoders at backend startup.
-        try:
-            self.ensure_processed_publisher(int(cam_id))
-        except Exception as exc:
-            print(f"[WEBRTC] ensure publisher failed camera_id={int(cam_id)}: {exc}")
+        if not self._external_workers:
+            try:
+                self.ensure_processed_publisher(int(cam_id))
+            except Exception as exc:
+                print(f"[WEBRTC] ensure publisher failed camera_id={int(cam_id)}: {exc}")
         streams = self.get_webrtc_streams(cam_ids=[int(cam_id)], public_base=public_base)
         return streams[0] if streams else {}
 
     def status(self) -> Dict[str, Any]:
+        if self._external_workers:
+            cams = self._db_camera_rows()
+            cam_ids = sorted(int(x.get("camera_id") or x.get("id")) for x in cams)
+            return {
+                "running": True,
+                "external_workers": True,
+                "camera_ids": cam_ids,
+                "num_cameras": len(cam_ids),
+                "webrtc_publishers": self.get_webrtc_streams(cam_ids=cam_ids),
+                "note": "Live AI is owned by external ai_worker.py processes. FastAPI is API/control-plane only.",
+            }
         if self._runner is None:
             self.start()
-        assert self._runner is not None
+        if self._runner is None:
+            return {"running": False, "camera_ids": [], "num_cameras": 0, "webrtc_publishers": []}
         st = self._runner.status()
         st["webrtc_publishers"] = self.get_webrtc_streams()
         return st
 
     def write_report_snapshot(self, path: str | None = None) -> str:
+        if self._external_workers:
+            return ""
         if self._runner is None:
             self.start()
-        assert self._runner is not None
+        if self._runner is None:
+            return ""
         return self._runner.write_report_snapshot(path=path)
 
 

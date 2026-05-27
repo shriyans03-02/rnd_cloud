@@ -137,6 +137,24 @@ class Settings(BaseSettings):
     TRACKING_HIDE_UNKNOWN: bool = False
     TRACKING_SHOW_UNKNOWN_LABELS: bool = True
 
+    # Startup resilience: camera table may be empty in a new DB, or RTSP cameras
+    # may be temporarily unreachable while Tailscale/subnet routing is being fixed.
+    # In that case FastAPI must still start so user/member/auth/admin APIs work.
+    TRACKING_SOFT_START: bool = True
+    TRACKING_ALLOW_EMPTY_SOURCES: bool = True
+    TRACKING_FAIL_ON_NO_SOURCES: bool = False
+    MEDIAMTX_KEEP_EXISTING_ON_EMPTY_DB: bool = True
+
+
+    # Multi-process live AI scaling.
+    # In production keep FastAPI API-only and run live AI via ai_worker.py.
+    TRACKING_EXTERNAL_WORKERS: bool = False
+    TRACKING_IN_API: bool = True
+    AI_WORKER_CAMERA_LIMIT: int = 8
+    AI_WORKER_REFRESH_SECONDS: int = 60
+    AI_WORKER_WORKERS: int = 0
+    AI_WORKER_LOG_DIR: str = "logs/ai_workers"
+
     # Embedding extraction UI preview. The backend publishes detected frames via
     # /api/v1/embeddings/preview and /api/v1/embeddings/preview.jpg instead of
     # opening a local cv2.imshow window on the server.

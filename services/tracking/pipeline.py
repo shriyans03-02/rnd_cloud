@@ -8573,6 +8573,27 @@ def _env_first(*names: str, default: str = "") -> str:
     return str(default or "")
 
 
+def _env_bool_any(*names: str, default: bool = False) -> bool:
+    for name in names:
+        raw = os.environ.get(str(name))
+        if raw is None or str(raw).strip() == "":
+            continue
+        return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+    return bool(default)
+
+
+def _tracking_soft_start_enabled() -> bool:
+    # Production API should still boot when no camera rows exist or when cameras
+    # are temporarily unreachable. Camera/network failures must not bring down
+    # users, auth, members, embeddings, reports, etc.
+    return _env_bool_any(
+        "TRACKING_SOFT_START",
+        "TRACKING_ALLOW_EMPTY_SOURCES",
+        "ALLOW_EMPTY_CAMERA_STARTUP",
+        default=True,
+    )
+
+
 def _build_direct_rtsp_url_from_ip(ip: str) -> str:
     template = _env_first(
         "RTSP_URL_TEMPLATE",
@@ -8626,25 +8647,44 @@ def resolve_auto_db_camera_sources(args: argparse.Namespace) -> argparse.Namespa
     selected_ids = [int(x) for x in (getattr(args, "camera_ids", []) or []) if int(x) > 0]
     selected_set = set(selected_ids)
     rows = []
-    with Session() as session:
-        stmt = select(CameraRow.id, CameraRow.name, CameraRow.ip_address, CameraRow.is_active)
-        db_rows = session.execute(stmt).all()
-        for r in db_rows:
-            try:
-                cam_id = int(r[0])
-            except Exception:
-                continue
-            active = bool(r[3]) if r[3] is not None else True
-            if not active:
-                continue
-            if selected_set and cam_id not in selected_set:
-                continue
-            rows.append({"id": cam_id, "name": str(r[1] or f"Camera {cam_id}"), "ip": str(r[2] or "").strip()})
+    try:
+        with Session() as session:
+            stmt = select(CameraRow.id, CameraRow.name, CameraRow.ip_address, CameraRow.is_active)
+            db_rows = session.execute(stmt).all()
+            for r in db_rows:
+                try:
+                    cam_id = int(r[0])
+                except Exception:
+                    continue
+                active = bool(r[3]) if r[3] is not None else True
+                if not active:
+                    continue
+                if selected_set and cam_id not in selected_set:
+                    continue
+                rows.append({"id": cam_id, "name": str(r[1] or f"Camera {cam_id}"), "ip": str(r[2] or "").strip()})
+    except Exception as exc:
+        try:
+            engine.dispose()
+        except Exception:
+            pass
+        if _tracking_soft_start_enabled():
+            print(f"[DB] Camera auto-load skipped: DB camera query failed ({type(exc).__name__}: {exc}). Starting API without live camera sources.")
+            args.src = []
+            args.camera_ids = []
+            args.camera_meta_by_id = {}
+            return args
+        raise
     try:
         engine.dispose()
     except Exception:
         pass
     if not rows:
+        if _tracking_soft_start_enabled():
+            print("[DB] No active DB cameras found for auto camera loading. Starting API without live camera sources.")
+            args.src = []
+            args.camera_ids = []
+            args.camera_meta_by_id = {}
+            return args
         raise RuntimeError("No active DB cameras found for auto camera loading")
 
     order = str(getattr(args, "db_camera_order", "id") or "id").lower()
@@ -10718,6 +10758,10 @@ class AdaptiveQueueStream:
                             kv[i] = (kk, str(v))
                             return
                     kv.append((k, str(v)))
+                # Tell OpenCV/FFmpeg to use TCP without modifying the RTSP URL.
+                # Appending ?rtsp_transport=tcp to Dahua/CP Plus URLs can make
+                # OpenCV fall back to CAP_IMAGES and treat the URL as a filename.
+                upsert("rtsp_transport", self.rtsp_transport)
                 if us > 0:
                     upsert("stimeout", us)
                     upsert("rw_timeout", us)
@@ -10727,8 +10771,10 @@ class AdaptiveQueueStream:
                 pass
         src_use = src
         if isinstance(src, str) and src.lower().startswith("rtsp"):
-            sep = "&" if "?" in src_use else "?"
-            src_use = f"{src_use}{sep}rtsp_transport={self.rtsp_transport}"
+            append_transport_query = str(os.environ.get("OPENCV_APPEND_RTSP_TRANSPORT_QUERY", "false")).strip().lower() in {"1", "true", "yes", "on", "y"}
+            if append_transport_query:
+                sep = "&" if "?" in src_use else "?"
+                src_use = f"{src_use}{sep}rtsp_transport={self.rtsp_transport}"
         self.src_use = src_use
         self.q: queue.Queue = queue.Queue(maxsize=self.queue_size)
         self.stop_flag = threading.Event()
@@ -14754,6 +14800,13 @@ class TrackingRunner:
         resolve_auto_db_camera_sources(args)
         _apply_scale_profile(args, len(getattr(args, "src", []) or []))
         if not getattr(args, "src", None):
+            if _tracking_soft_start_enabled():
+                print("[INIT] (service) No live camera sources configured. API will continue without live tracking threads.")
+                self._streams = []
+                self._render_by_cam = {}
+                self._raw_by_cam = {}
+                self._started = True
+                return
             raise RuntimeError("No camera sources configured. Provide --src or enable --auto-db-cameras with active DB cameras.")
         if not getattr(args, "camera_ids", None):
             args.camera_ids = []
@@ -15008,37 +15061,39 @@ class TrackingRunner:
             buf = RenderedFrame()
             self._render_by_cam[int(camera_db_id)] = buf
             self._streams.append({"sid": sid, "camera_db_id": camera_db_id, "src": raw_src, "vs": vs, "deep": deep_tracker, "iou": iou_tracker, "buf": buf, "raw_buf": raw_buf})
-        if not any(s["vs"].is_opened() for s in self._streams):
-            for s in self._streams:
+        if self._streams and not any(s["vs"].is_opened() for s in self._streams):
+            if _env_bool_any("TRACKING_FAIL_ON_NO_SOURCES", default=False):
+                for s in self._streams:
+                    try:
+                        s["vs"].release()
+                    except Exception:
+                        pass
                 try:
-                    s["vs"].release()
+                    if self._csv_stop_evt is not None:
+                        self._csv_stop_evt.set()
+                    if self._csv_thread is not None:
+                        self._csv_thread.join(timeout=2.0)
                 except Exception:
                     pass
-            try:
-                if self._csv_stop_evt is not None:
-                    self._csv_stop_evt.set()
-                if self._csv_thread is not None:
-                    self._csv_thread.join(timeout=2.0)
-            except Exception:
-                pass
-            _finalize_tracking_reports(self._report, self._normalized_report, self.args)
-            if self._normalized_data_writer is not None:
-                try:
-                    self._normalized_data_writer.close()
-                except Exception:
-                    pass
-            if self._embed_updater is not None:
-                try:
-                    self._embed_updater.close()
-                except Exception:
-                    pass
-            if self._access_monitor is not None:
-                try:
-                    self._access_monitor.close()
-                except Exception:
-                    pass
-                self._access_monitor = None
-            raise RuntimeError("No sources opened. Check --src URLs and codecs.")
+                _finalize_tracking_reports(self._report, self._normalized_report, self.args)
+                if self._normalized_data_writer is not None:
+                    try:
+                        self._normalized_data_writer.close()
+                    except Exception:
+                        pass
+                if self._embed_updater is not None:
+                    try:
+                        self._embed_updater.close()
+                    except Exception:
+                        pass
+                if self._access_monitor is not None:
+                    try:
+                        self._access_monitor.close()
+                    except Exception:
+                        pass
+                    self._access_monitor = None
+                raise RuntimeError("No sources opened. Check --src URLs and codecs.")
+            print("[WARN] (service) No camera sources opened at startup. Keeping API alive; RTSP readers will reconnect in the background.")
         for s in self._streams:
             t = threading.Thread(
                 target=processor_thread_with_stop,

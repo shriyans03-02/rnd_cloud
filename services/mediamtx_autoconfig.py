@@ -196,7 +196,19 @@ def maybe_generate_mediamtx_config() -> Tuple[bool, str]:
     if not _bool_env("MEDIAMTX_AUTOCONFIG", True):
         return False, "MEDIAMTX_AUTOCONFIG disabled"
     path = Path(_env("MEDIAMTX_CONFIG_PATH", "/root/mediamtx.yml")).expanduser()
-    cams = load_active_cameras_from_db()
+    keep_existing_empty = _bool_env("MEDIAMTX_KEEP_EXISTING_ON_EMPTY_DB", True)
+    try:
+        cams = load_active_cameras_from_db()
+    except Exception as exc:
+        if keep_existing_empty and path.exists():
+            msg = f"[MEDIAMTX-AUTO] DB camera load failed ({type(exc).__name__}: {exc}); keeping existing {path}"
+            print(msg)
+            return False, msg
+        raise
+    if not cams and keep_existing_empty and path.exists():
+        msg = f"[MEDIAMTX-AUTO] no DB cameras found; keeping existing {path}"
+        print(msg)
+        return False, msg
     data = build_mediamtx_config(cams)
     path.parent.mkdir(parents=True, exist_ok=True)
     old = path.read_text(encoding="utf-8") if path.exists() else ""

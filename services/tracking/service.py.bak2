@@ -1104,18 +1104,13 @@ class PlaybackCleanRestream:
             )
         )
 
-        # Let FFmpeg auto-detect plain h264/hevc playback streams by default.
-        # CP Plus/Dahua NVRs can return either H264 or HEVC depending on channel,
-        # profile, or exported playback segment. Forcing "-c:v hevc" on an H264
-        # segment makes FFmpeg exit immediately, which previously became a 500
-        # in the UI even though VLC could play the same URL. Only hardware
-        # decoders are forced explicitly.
-        decoder_l = decoder.lower().strip()
-        auto_detect_plain_codecs = _setting_bool("PLAYBACK_CLEAN_RESTREAM_AUTO_DETECT_CODEC", True)
-        if decoder and decoder_l not in {"auto", "none", "default"}:
-            if decoder_l in {"hevc_cuvid", "h264_cuvid"}:
+        # Force the software decoder by default. Do not use hevc_cuvid for CP Plus
+        # playback unless explicitly configured; the GPU decoder tends to expose
+        # the broken reference frames as large visual block corruption.
+        if decoder and decoder.lower() not in {"auto", "none", "default"}:
+            if decoder.lower() in {"hevc_cuvid", "h264_cuvid"}:
                 cmd += ["-hwaccel", "cuda", "-c:v", decoder]
-            elif (not auto_detect_plain_codecs) or decoder_l not in {"hevc", "h265", "h264", "avc"}:
+            else:
                 cmd += ["-c:v", decoder]
 
         cmd += ["-i", self.raw_rtsp_source, "-map", "0:v:0", "-an"]
@@ -1276,12 +1271,6 @@ class PlaybackCleanRestream:
             time.sleep(0.15)
         if self._proc is not None and self._proc.poll() is None:
             self._error = f"playback clean restream alive but RTSP path was not ready before timeout: {self.rtsp_output}"
-            if _setting_bool("PLAYBACK_CLEAN_RESTREAM_ALLOW_SLOW_READY", True):
-                try:
-                    print(f"[PLAYBACK-CLEAN][WARN] {self._error}; continuing and letting the reader reconnect")
-                except Exception:
-                    pass
-                return True
         return False
 
     def stop(self) -> None:
@@ -2058,35 +2047,18 @@ class PlaybackTracingService:
                 if not clean_restream.wait_until_ready():
                     err = clean_restream.error() or "clean restream did not stay alive"
                     clean_restream.stop()
-                    if _setting_bool("PLAYBACK_CLEAN_RESTREAM_FALLBACK_TO_RAW_ON_ERROR", True):
-                        print(
-                            f"[PLAYBACK-CLEAN][WARN] clean restream failed for camera_id={int(camera_id)}; "
-                            f"falling back to raw NVR playback for this session: {err}"
-                        )
-                        clean_restream = None
-                        pipeline_rtsp_source = raw_rtsp_source
-                    else:
-                        raise RuntimeError(err)
-                else:
-                    pipeline_rtsp_source = clean_restream.rtsp_output
-                    print(
-                        f"[PLAYBACK-CLEAN] camera_id={int(camera_id)} "
-                        f"raw={_redact_rtsp_url(raw_rtsp_source)} -> clean={pipeline_rtsp_source}"
-                    )
-            except Exception as exc:
+                    raise RuntimeError(err)
+                pipeline_rtsp_source = clean_restream.rtsp_output
+                print(
+                    f"[PLAYBACK-CLEAN] camera_id={int(camera_id)} "
+                    f"raw={_redact_rtsp_url(raw_rtsp_source)} -> clean={pipeline_rtsp_source}"
+                )
+            except Exception:
                 try:
                     clean_restream.stop()
                 except Exception:
                     pass
-                if _setting_bool("PLAYBACK_CLEAN_RESTREAM_FALLBACK_TO_RAW_ON_ERROR", True):
-                    print(
-                        f"[PLAYBACK-CLEAN][WARN] clean restream start/probe raised for camera_id={int(camera_id)}; "
-                        f"falling back to raw NVR playback for this session: {exc}"
-                    )
-                    clean_restream = None
-                    pipeline_rtsp_source = raw_rtsp_source
-                else:
-                    raise
+                raise
 
         args = self._build_session_args(
             rtsp_source=str(pipeline_rtsp_source),

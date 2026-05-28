@@ -332,12 +332,10 @@ def start_ffmpeg_stream(
             "PLAYBACK_CLEAN_RESTREAM_FFMPEG_FLAGS",
             "-fflags +genpts+discardcorrupt -err_detect ignore_err -analyzeduration 10000000 -probesize 10000000 -max_delay 5000000",
         ))
-        decoder_l = decoder.lower().strip()
-        auto_detect_plain_codecs = _settings_bool("PLAYBACK_CLEAN_RESTREAM_AUTO_DETECT_CODEC", True)
-        if decoder and decoder_l not in {"auto", "none", "default"}:
-            if decoder_l in {"hevc_cuvid", "h264_cuvid"}:
+        if decoder and decoder.lower() not in {"auto", "none", "default"}:
+            if decoder.lower() in {"hevc_cuvid", "h264_cuvid"}:
                 cmd += ["-hwaccel", "cuda", "-c:v", decoder]
-            elif (not auto_detect_plain_codecs) or decoder_l not in {"hevc", "h265", "h264", "avc"}:
+            else:
                 cmd += ["-c:v", decoder]
         cmd += ["-i", rtsp_source, "-map", "0:v:0", "-an", "-vf", ",".join(vf_parts), "-c:v", encoder]
         if encoder.lower() in {"libx264", "h264"}:
@@ -556,15 +554,6 @@ async def start_playback(
                 ),
             )
         except Exception as exc:
-            logger.exception(
-                "Annotated CP Plus playback failed camera_id=%s channel=%s start=%s end=%s mode=%s member_id=%s",
-                camera_id,
-                channel,
-                start_time,
-                end_time,
-                resolved_mode,
-                member_id,
-            )
             raise HTTPException(
                 status_code=500,
                 detail=f"Could not start the annotated CP Plus playback session: {exc}",

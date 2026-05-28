@@ -261,18 +261,9 @@ class Settings(BaseSettings):
     PLAYBACK_CLEAN_RESTREAM_LOG_DIR: str = "logs/playback_clean_restream"
     PLAYBACK_CLEAN_RESTREAM_PATH_PREFIX: str = "playback_clean_"
     PLAYBACK_CLEAN_RESTREAM_WARMUP_SECONDS: float = 6.0
-    PLAYBACK_CLEAN_RESTREAM_FFMPEG_FLAGS: str = "-fflags +genpts+igndts -flags2 +showall -err_detect ignore_err -max_delay 5000000 -analyzeduration 10000000 -probesize 10000000"
+    PLAYBACK_CLEAN_RESTREAM_FFMPEG_FLAGS: str = "-fflags +genpts -flags2 +showall -err_detect ignore_err -max_delay 1000000 -analyzeduration 3000000 -probesize 3000000"
     PLAYBACK_CLEAN_RESTREAM_FORCE_FPS_FILTER: bool = False
     PLAYBACK_CLEAN_RESTREAM_READY_PROBE: bool = True
-    # NVR playback can take longer than the local warmup to become DESCRIBE-ready.
-    # If FFmpeg is still alive, continue the session and let the OpenCV reader reconnect
-    # instead of throwing a user-visible HTTP 500.
-    PLAYBACK_CLEAN_RESTREAM_ALLOW_SLOW_READY: bool = True
-    # If the NVR returns a codec different from the configured decoder or clean restream
-    # cannot be started, do not fail the route immediately; fall back to raw NVR playback.
-    PLAYBACK_CLEAN_RESTREAM_FALLBACK_TO_RAW_ON_ERROR: bool = True
-    # Plain hevc/h264 values are treated as hints; FFmpeg auto-detects the real codec.
-    PLAYBACK_CLEAN_RESTREAM_AUTO_DETECT_CODEC: bool = True
     PLAYBACK_PUBLISHER_READY_TIMEOUT_SECONDS: float = 2.0
 
     # Optional playback overlay tuning used by patched pipeline_tracing draw paths.

@@ -1209,19 +1209,69 @@ class PlaybackCleanRestream:
             self._stderr_handle = None
             raise
 
+
+    def _ffprobe_bin(self) -> str:
+        ffmpeg = str(self.ffmpeg_bin or "ffmpeg")
+        base = os.path.basename(ffmpeg).lower()
+        if base.startswith("ffmpeg"):
+            cand = os.path.join(os.path.dirname(ffmpeg), "ffprobe") if os.path.dirname(ffmpeg) else "ffprobe"
+        else:
+            cand = "ffprobe"
+        try:
+            import shutil
+            if os.path.isabs(cand) and os.path.exists(cand):
+                return cand
+            found = shutil.which(cand)
+            if found:
+                return found
+        except Exception:
+            pass
+        return cand
+
+    def _probe_rtsp_ready(self, timeout_s: float = 1.5) -> bool:
+        """Return True when MediaMTX is actually serving the clean RTSP path."""
+        if not _setting_bool("PLAYBACK_CLEAN_RESTREAM_READY_PROBE", True):
+            return True
+        probe_bin = self._ffprobe_bin()
+        cmd = [
+            probe_bin,
+            "-v", "error",
+            "-rtsp_transport", "tcp",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name",
+            "-of", "csv=p=0",
+            self.rtsp_output,
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=max(0.5, float(timeout_s or 1.5)),
+                check=False,
+            )
+            return proc.returncode == 0 and bool(str(proc.stdout or proc.stderr or "").strip())
+        except Exception:
+            return False
+
     def wait_until_ready(self, timeout: Optional[float] = None) -> bool:
-        # MediaMTX does not need an explicit API call here: once FFmpeg publishes
-        # to playback_clean_*, the AI runner can open that local RTSP path. We
-        # just give FFmpeg a short warmup and fail early if the process exits.
+        # Wait until FFmpeg is alive AND MediaMTX can DESCRIBE the clean path.
+        # Without this probe the AI runner can open playback_clean_* too early,
+        # receive 404/empty frames, then reconnect to the wrong point in the clip.
         if timeout is None:
-            timeout = _setting_float("PLAYBACK_CLEAN_RESTREAM_WARMUP_SECONDS", 2.0)
+            timeout = _setting_float("PLAYBACK_CLEAN_RESTREAM_WARMUP_SECONDS", 6.0)
         deadline = time.monotonic() + max(0.0, float(timeout or 0.0))
         while time.monotonic() < deadline:
             if self._proc is not None and self._proc.poll() is not None:
-                self._error = f"playback clean restream exited early with code {self._proc.returncode}: {self._tail_log(1200)}"
+                self._error = f"playback clean restream exited early with code {self._proc.returncode}: {self._tail_log(1600)}"
                 return False
-            time.sleep(0.1)
-        return bool(self._proc is not None and self._proc.poll() is None)
+            if self._proc is not None and self._proc.poll() is None and self._probe_rtsp_ready(timeout_s=1.0):
+                return True
+            time.sleep(0.15)
+        if self._proc is not None and self._proc.poll() is None:
+            self._error = f"playback clean restream alive but RTSP path was not ready before timeout: {self.rtsp_output}"
+        return False
 
     def stop(self) -> None:
         proc = self._proc
@@ -1809,6 +1859,127 @@ class PlaybackTracingService:
                 return
         self.stop_session(session_id)
 
+
+    def _monitor_playback_readiness(
+        self,
+        *,
+        session_id: str,
+        args: argparse.Namespace,
+        raw_wait_s: float,
+        ai_wait_s: float,
+    ) -> None:
+        """Wait for raw/AI frames without blocking the HTTP playback response.
+
+        The browser can connect to MediaMTX immediately while this background
+        monitor checks whether the AI runner is healthy. If CUDA playback AI
+        fails to produce frames, it restarts only the playback runner with the
+        configured fallback device and hot-swaps the publisher buffers. Live AI
+        workers are not touched.
+        """
+        try:
+            with self._lock:
+                session = self._sessions.get(str(session_id))
+            if session is None:
+                return
+
+            old_runner = session.runner
+            buf = session.buffer
+            try:
+                raw_buf = old_runner.get_camera_raw_buffer(int(session.camera_id))
+            except Exception:
+                raw_buf = None
+
+            raw_ready, raw_wait_info = self._wait_for_buffer_frame(
+                raw_buf if raw_buf is not None else buf,
+                timeout_seconds=float(raw_wait_s),
+                require_success=False,
+                label="raw",
+            )
+            if raw_ready:
+                print(f"[PLAYBACK-AI] raw clean frames ready camera_id={int(session.camera_id)} source={session.rtsp_source}")
+            else:
+                print(f"[PLAYBACK-AI] raw clean frames not ready yet camera_id={int(session.camera_id)} info={raw_wait_info}")
+
+            ai_ready, ai_wait_info = self._wait_for_buffer_frame(
+                buf,
+                timeout_seconds=float(ai_wait_s),
+                require_success=True,
+                label="processed_ai",
+            )
+            if ai_ready:
+                print(f"[PLAYBACK-AI] processed AI frames ready camera_id={int(session.camera_id)} device={getattr(args, 'device', '')}")
+                return
+
+            print(f"[PLAYBACK-AI] processed AI frames not ready camera_id={int(session.camera_id)} device={getattr(args, 'device', '')} info={ai_wait_info}")
+            if not self._should_fallback_playback_ai(args):
+                return
+
+            fallback_args = self._make_fallback_args(args)
+            print(
+                f"[PLAYBACK-AI] starting fallback playback AI runner "
+                f"camera_id={int(session.camera_id)} device={getattr(fallback_args, 'device', '')}"
+            )
+            new_runner = TrackingRunner(fallback_args)
+            try:
+                new_runner.start()
+                new_buf = new_runner.get_camera_buffer(int(session.camera_id))
+                try:
+                    new_raw_buf = new_runner.get_camera_raw_buffer(int(session.camera_id))
+                except Exception:
+                    new_raw_buf = None
+                if new_buf is None:
+                    raise RuntimeError(f"fallback buffer not available for camera_id={int(session.camera_id)}")
+
+                # Give fallback a short chance to produce at least one diagnostic
+                # or real frame, but do not block forever.
+                self._wait_for_buffer_frame(
+                    new_raw_buf if new_raw_buf is not None else new_buf,
+                    timeout_seconds=min(max(2.0, float(raw_wait_s)), 8.0),
+                    require_success=False,
+                    label="raw_fallback",
+                )
+                self._wait_for_buffer_frame(
+                    new_buf,
+                    timeout_seconds=min(max(2.0, float(ai_wait_s)), 8.0),
+                    require_success=True,
+                    label="processed_ai_fallback",
+                )
+
+                with self._lock:
+                    live_session = self._sessions.get(str(session_id))
+                    if live_session is None or live_session.runner is not old_runner:
+                        try:
+                            new_runner.stop()
+                        except Exception:
+                            pass
+                        return
+                    live_session.runner = new_runner
+                    live_session.buffer = new_buf
+                    publisher = live_session.publisher
+
+                try:
+                    if publisher is not None and hasattr(publisher, "set_buffers"):
+                        publisher.set_buffers(new_buf, new_raw_buf)
+                    elif publisher is not None:
+                        publisher.buffer = new_buf
+                        publisher.raw_buffer = new_raw_buf
+                except Exception as exc:
+                    print(f"[PLAYBACK-AI] fallback publisher buffer swap warning: {exc}")
+
+                try:
+                    old_runner.stop()
+                except Exception:
+                    pass
+                print(f"[PLAYBACK-AI] fallback runner active camera_id={int(session.camera_id)} device={getattr(fallback_args, 'device', '')}")
+            except Exception as exc:
+                try:
+                    new_runner.stop()
+                except Exception:
+                    pass
+                print(f"[PLAYBACK-AI] fallback runner failed camera_id={int(session.camera_id)}: {exc}")
+        except Exception as exc:
+            print(f"[PLAYBACK-AI] readiness monitor failed session_id={session_id}: {exc}")
+
     def start_session(
         self,
         *,
@@ -1935,86 +2106,11 @@ class PlaybackTracingService:
 
         raw_wait_s = self._playback_float("PLAYBACK_WAIT_FOR_RAW_SECONDS", 30.0)
         ai_wait_s = self._playback_float("PLAYBACK_WAIT_FOR_AI_SECONDS", 10.0)
-        raw_ready, raw_wait_info = self._wait_for_buffer_frame(
-            raw_buf if raw_buf is not None else buf,
-            timeout_seconds=raw_wait_s,
-            require_success=False,
-            label="raw",
-        )
-        if raw_ready:
-            print(f"[PLAYBACK-AI] raw clean frames ready camera_id={int(camera_id)} source={pipeline_rtsp_source}")
-        else:
-            print(f"[PLAYBACK-AI] raw clean frames not ready yet camera_id={int(camera_id)} info={raw_wait_info}")
 
-        ai_ready, ai_wait_info = self._wait_for_buffer_frame(
-            buf,
-            timeout_seconds=ai_wait_s,
-            require_success=True,
-            label="processed_ai",
-        )
-
-        if (not ai_ready) and self._should_fallback_playback_ai(args):
-            print(
-                f"[PLAYBACK-AI] no processed AI frame from GPU after {ai_wait_s:.1f}s; "
-                f"restarting playback AI runner with {os.environ.get('PLAYBACK_AI_FALLBACK_DEVICE') or getattr(settings, 'PLAYBACK_AI_FALLBACK_DEVICE', 'cpu')} | info={ai_wait_info}"
-            )
-            try:
-                runner.stop()
-            except Exception:
-                pass
-            args = self._make_fallback_args(args)
-            runner = TrackingRunner(args)
-            try:
-                runner.start()
-            except Exception:
-                try:
-                    runner.stop()
-                except Exception:
-                    pass
-                if clean_restream is not None:
-                    try:
-                        clean_restream.stop()
-                    except Exception:
-                        pass
-                raise
-            buf = runner.get_camera_buffer(int(camera_id))
-            try:
-                raw_buf = runner.get_camera_raw_buffer(int(camera_id))
-            except Exception:
-                raw_buf = None
-            if buf is None:
-                try:
-                    runner.stop()
-                except Exception:
-                    pass
-                if clean_restream is not None:
-                    try:
-                        clean_restream.stop()
-                    except Exception:
-                        pass
-                raise RuntimeError(f"Camera buffer not available after AI fallback for camera_id={int(camera_id)}")
-            raw_ready, raw_wait_info = self._wait_for_buffer_frame(
-                raw_buf if raw_buf is not None else buf,
-                timeout_seconds=min(max(2.0, raw_wait_s), 15.0),
-                require_success=False,
-                label="raw_fallback",
-            )
-            ai_ready, ai_wait_info = self._wait_for_buffer_frame(
-                buf,
-                timeout_seconds=max(2.0, ai_wait_s),
-                require_success=True,
-                label="processed_ai_fallback",
-            )
-
-        if ai_ready:
-            print(f"[PLAYBACK-AI] processed AI frames ready camera_id={int(camera_id)} device={getattr(args, 'device', '')}")
-        else:
-            print(f"[PLAYBACK-AI] processed AI frames still not ready camera_id={int(camera_id)} device={getattr(args, 'device', '')} info={ai_wait_info}")
-
-        # Publish playback_trace_* in hybrid mode: raw clean H264 frames provide
-        # smooth motion at WebRTC FPS, while the latest AI metadata is overlaid
-        # as soon as detection finishes.  This avoids the slow-motion effect
-        # caused by publishing only the processed/detected frame cadence.
+        # Publish playback_trace_* immediately.  The UI should not wait for the
+        # AI detector before receiving a WebRTC URL.  Hybrid mode publishes raw
+        # clean H264 motion first and overlays known-person boxes whenever fresh
+        # AI metadata becomes available.
         publisher = ProcessedFrameRtspPublisher(
             buffer=buf,
             raw_buffer=raw_buf,
@@ -2029,13 +2125,16 @@ class PlaybackTracingService:
             bitrate=_setting_str("PLAYBACK_WEBRTC_BITRATE", "6000k") or "6000k",
             bufsize=_setting_str("PLAYBACK_WEBRTC_BUFSIZE", "12000k") or "12000k",
             x264_preset=_setting_str("PLAYBACK_WEBRTC_PRESET", "ultrafast") or "ultrafast",
-            overlay_max_age_ms=_setting_int("PLAYBACK_WEBRTC_OVERLAY_MAX_AGE_MS", 2500),
+            overlay_max_age_ms=_setting_int("PLAYBACK_WEBRTC_OVERLAY_MAX_AGE_MS", 800),
             gop=_setting_int("PLAYBACK_WEBRTC_GOP", 40),
             draw_stats=_setting_bool("PLAYBACK_OVERLAY_FPS", True),
             log_dir=_setting_str("PLAYBACK_WEBRTC_LOG_DIR", "logs/playback_webrtc") or "logs/playback_webrtc",
         )
         try:
             publisher.start()
+            # A placeholder frame is enough to make MediaMTX create the path.
+            # Raw/AI readiness is checked asynchronously below.
+            publisher.wait_until_ready(timeout=self._playback_float("PLAYBACK_PUBLISHER_READY_TIMEOUT_SECONDS", 2.0))
         except Exception:
             try:
                 runner.stop()
@@ -2074,6 +2173,18 @@ class PlaybackTracingService:
 
         watch_thr = threading.Thread(target=self._watch_session, args=(session_id,), daemon=True)
         watch_thr.start()
+
+        readiness_thr = threading.Thread(
+            target=self._monitor_playback_readiness,
+            kwargs={
+                "session_id": session_id,
+                "args": copy.deepcopy(args),
+                "raw_wait_s": raw_wait_s,
+                "ai_wait_s": ai_wait_s,
+            },
+            daemon=True,
+        )
+        readiness_thr.start()
 
         if auto_stop_seconds > 0:
             thr = threading.Thread(

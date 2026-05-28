@@ -219,7 +219,7 @@ class Settings(BaseSettings):
     # If CUDA playback AI does not produce frames, automatically restart only
     # the playback AI runner on CPU while keeping the clean restream/WebRTC path alive.
     PLAYBACK_WAIT_FOR_RAW_SECONDS: float = 30.0
-    PLAYBACK_WAIT_FOR_AI_SECONDS: float = 10.0
+    PLAYBACK_WAIT_FOR_AI_SECONDS: float = 20.0
     PLAYBACK_AI_FALLBACK_ON_TIMEOUT: bool = True
     PLAYBACK_AI_FALLBACK_DEVICE: str = "cpu"
     PLAYBACK_AI_ERROR_LOG_INTERVAL_SECONDS: float = 2.0
@@ -238,7 +238,7 @@ class Settings(BaseSettings):
     PLAYBACK_WEBRTC_BITRATE: str = "6000k"
     PLAYBACK_WEBRTC_BUFSIZE: str = "12000k"
     PLAYBACK_WEBRTC_PRESET: str = "ultrafast"
-    PLAYBACK_WEBRTC_OVERLAY_MAX_AGE_MS: int = 2500
+    PLAYBACK_WEBRTC_OVERLAY_MAX_AGE_MS: int = 800
 
     # CP Plus playback clean restream stage. This is intentionally separate from
     # the live NVDEC restream: CP Plus H265 playback can start mid-GOP and is
@@ -260,9 +260,11 @@ class Settings(BaseSettings):
     PLAYBACK_CLEAN_RESTREAM_RTSP_TRANSPORT: str = "tcp"
     PLAYBACK_CLEAN_RESTREAM_LOG_DIR: str = "logs/playback_clean_restream"
     PLAYBACK_CLEAN_RESTREAM_PATH_PREFIX: str = "playback_clean_"
-    PLAYBACK_CLEAN_RESTREAM_WARMUP_SECONDS: float = 2.0
-    PLAYBACK_CLEAN_RESTREAM_FFMPEG_FLAGS: str = "-fflags +genpts -flags2 +showall -err_detect ignore_err -analyzeduration 10000000 -probesize 10000000 -max_delay 5000000"
+    PLAYBACK_CLEAN_RESTREAM_WARMUP_SECONDS: float = 6.0
+    PLAYBACK_CLEAN_RESTREAM_FFMPEG_FLAGS: str = "-fflags +genpts -flags2 +showall -err_detect ignore_err -max_delay 1000000 -analyzeduration 3000000 -probesize 3000000"
     PLAYBACK_CLEAN_RESTREAM_FORCE_FPS_FILTER: bool = False
+    PLAYBACK_CLEAN_RESTREAM_READY_PROBE: bool = True
+    PLAYBACK_PUBLISHER_READY_TIMEOUT_SECONDS: float = 2.0
 
     # Optional playback overlay tuning used by patched pipeline_tracing draw paths.
     PLAYBACK_OVERLAY_FONT_SCALE: float = 0.45

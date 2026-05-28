@@ -137,6 +137,40 @@ class ProcessedFrameRtspPublisher:
         self._forced_codec: str = ""
         self._nvenc_failed: bool = False
 
+
+    def set_buffers(self, buffer: Any, raw_buffer: Any = None) -> None:
+        """Atomically switch the processed/raw frame sources.
+
+        Playback AI fallback can restart the TrackingRunner on CPU after the
+        WebRTC publisher has already started.  The old buffer sequence numbers
+        may be higher than the new runner's sequence numbers, so reset the
+        sequence cursors and cached frames when changing sources.
+        """
+        for old_buf in (getattr(self, "buffer", None), getattr(self, "raw_buffer", None)):
+            if old_buf is not None and hasattr(old_buf, "remove_client"):
+                try:
+                    old_buf.remove_client()
+                except Exception:
+                    pass
+        self.buffer = buffer
+        self.raw_buffer = raw_buffer
+        for new_buf in (self.buffer, self.raw_buffer):
+            if new_buf is not None and hasattr(new_buf, "add_client"):
+                try:
+                    new_buf.add_client()
+                except Exception:
+                    pass
+        self._last_processed_seq = -1
+        self._last_raw_seq = -1
+        self._latest_processed_frame = None
+        self._latest_raw_frame = None
+        self._latest_meta = {}
+        self._latest_raw_meta = {}
+        self._latest_processed_arrival_ts = 0.0
+        self._latest_raw_arrival_ts = 0.0
+        self._raw_fps_ema = 0.0
+        self._last_raw_fps_ts = 0.0
+
     def _resolve_ffmpeg_bin(self) -> str:
         candidate = str(self.ffmpeg_bin or "ffmpeg").strip()
         if not candidate:

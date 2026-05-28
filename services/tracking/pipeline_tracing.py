@@ -6733,6 +6733,11 @@ def process_one_frame(
         low_face_hit = bool(r.get("low_face_hit", False))
         low_face_sim = float(r.get("low_face_sim", 0.0) or 0.0)
         if bool(getattr(args, "hide_unknown", False)) and not final_name:
+            # Playback tracing must be clean: show only confirmed known matches.
+            # Live behavior is untouched because live normally runs with
+            # TRACKING_HIDE_UNKNOWN=False / args.hide_unknown=False.
+            if bool(getattr(args, "is_playback", False)):
+                continue
             if not low_face_hit:
                 continue
         disp_face_sim = float(face_sim) if face_hit else float(entry.get("last_face_sim", last_face_sim))

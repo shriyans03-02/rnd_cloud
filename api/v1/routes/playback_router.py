@@ -37,6 +37,11 @@ _STREAM_NAME_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,96}$")
 _CPPLUS_TIME_FORMAT = "%Y_%m_%d_%H_%M_%S"
 
 
+def _nvr_time_format() -> str:
+    fmt = _settings_str("NVR_PLAYBACK_TIME_FORMAT", _CPPLUS_TIME_FORMAT).strip()
+    return fmt or _CPPLUS_TIME_FORMAT
+
+
 def _validate_stream_name(name: str) -> str:
     cleaned = str(name or "").strip()
     if not _STREAM_NAME_RE.match(cleaned):
@@ -129,7 +134,7 @@ def _parse_iso_dt(value: str) -> datetime:
         raise ValueError("timestamp is required")
 
     # Accept CP Plus formatted values too, useful for direct testing/curl.
-    for fmt in (_CPPLUS_TIME_FORMAT, "%Y%m%dT%H%M%SZ"):
+    for fmt in (_nvr_time_format(), _CPPLUS_TIME_FORMAT, "%Y%m%dT%H%M%SZ"):
         try:
             return datetime.strptime(raw, fmt)
         except ValueError:
@@ -151,7 +156,7 @@ def _format_cpplus_time(dt: datetime) -> str:
     tz = _nvr_tz()
     if dt.tzinfo is not None and tz is not None:
         dt = dt.astimezone(tz)
-    return dt.strftime(_CPPLUS_TIME_FORMAT)
+    return dt.strftime(_nvr_time_format())
 
 
 def to_nvr_time(value: str) -> str:

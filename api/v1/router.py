@@ -5,7 +5,9 @@ from app.api.v1.routes import (
     departments,
     site_hierarchy,
     site_locations,
+    device_brands,
     cameras,
+    nvrs,
     access_groups,
     members,
     site_location_access,
@@ -27,7 +29,9 @@ v1_router.include_router(users.router, prefix="/users", tags=["Users"])
 v1_router.include_router(departments.router, prefix="/departments", tags=["Departments"])
 v1_router.include_router(site_hierarchy.router, prefix="/site_hierarchy", tags=["SiteHierarchy"])
 v1_router.include_router(site_locations.router, prefix="/site_locations", tags=["SiteLocation"])
+v1_router.include_router(device_brands.router, prefix="/device-brands", tags=["Device Brands"])
 v1_router.include_router(cameras.router, prefix="/cameras", tags=["Cameras"])
+v1_router.include_router(nvrs.router, prefix="/nvrs", tags=["NVRs"])
 v1_router.include_router(access_groups.router, prefix="/access_groups", tags=["Access Groups"])
 v1_router.include_router(members.router, prefix="/members", tags=["Members"])
 v1_router.include_router(site_location_access.router, prefix="/site_location_access", tags=["Site Location Acess"])

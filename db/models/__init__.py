@@ -2,6 +2,8 @@ from .user import User
 from .department import Department
 from .site_hierarchy import SiteHierarchy
 from .site_location import SiteLocation
+from .device_brand import DeviceBrand
+from .nvr import NVR
 from .camera import Camera
 from .access_group import AccessGroup
 from .member import Member

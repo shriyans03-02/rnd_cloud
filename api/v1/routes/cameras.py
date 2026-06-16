@@ -6,6 +6,7 @@ from typing import Optional
 from sqlalchemy.orm import Session, joinedload
 from app.repositories.site_hierarchy_repo import SiteHierarchyRepository
 from app.schemas.camera import (
+    CameraBrandTemplateOut,
     CameraCreate,
     CameraUpdate,
     CameraOut,
@@ -20,6 +21,18 @@ from app.db.models.user import User
 from sqlalchemy import or_
 
 router = APIRouter()
+
+
+@router.get("/brands", response_model=MessageResponse[list[CameraBrandTemplateOut]])
+def list_camera_brand_templates(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return {
+        "message": "Camera brand templates fetched successfully",
+        "data": CameraService.brand_templates(db),
+    }
+
 
 @router.get("/search", response_model=MessageResponse[list[dict]])
 def search_cameras(
@@ -41,6 +54,7 @@ def search_cameras(
             or_(
                 Camera.name.ilike(like),
                 Camera.ip_address.ilike(like),
+                Camera.brand.ilike(like),
                 SiteHierarchy.name.ilike(like),
             )
         )
@@ -52,7 +66,10 @@ def search_cameras(
             "id": cam.id,
             "name": cam.name,
             "ip_address": cam.ip_address,
-            "site_location": cam.site_location,  # uses computed property
+            "brand": cam.brand,
+            "brand_id": cam.brand_id,
+            "brand_label": cam.brand_label,
+            "site_location": cam.site_location,
         }
         for cam in cameras
     ]
@@ -95,7 +112,7 @@ def list_site_locations(
         )
     )
 
-    if search:                                   # ← add this block
+    if search:
         query = query.filter(
             SiteHierarchy.name.ilike(f"%{search}%")
         )
@@ -147,12 +164,7 @@ def create_camera(
     current_user: User = Depends(get_current_user),
 ):
     camera = CameraService.create_camera(db, payload, actor_id=current_user.id)
-    camera = (
-        db.query(Camera)
-        .options(joinedload(Camera.site_location_rel))
-        .filter(Camera.id == camera.id)
-        .first()
-    )
+    camera = CameraService.get_camera(db, camera.id)
     return {"message": "Camera created successfully", "data": camera}
 
 # GET camera by ID
@@ -162,16 +174,7 @@ def get_camera(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    camera = (
-        db.query(Camera)
-        .options(joinedload(Camera.site_location_rel))
-        .filter(Camera.id == camera_id)
-        .first()
-    )
-
-    if not camera:
-        raise HTTPException(status_code=404, detail="Camera not found")
-
+    camera = CameraService.get_camera(db, camera_id)
     return {"message": "Camera fetched successfully", "data": camera}
 
 
@@ -200,8 +203,8 @@ def update_camera(
     current_user: User = Depends(get_current_user),
 ):
     camera = CameraService.update_camera(db, camera_id, payload, actor_id=current_user.id)
+    camera = CameraService.get_camera(db, camera.id)
     return {"message": "Camera updated successfully", "data": camera}
-
 
 
 # DELETE camera

@@ -101,6 +101,15 @@ class ProcessedFrameRtspPublisher:
         self.log_dir = str(log_dir or "logs/ffmpeg_webrtc")
         self.restart_delay_seconds = float(max(0.05, float(restart_delay_seconds or 0.5)))
 
+        # Keep RTSP RTP packets below common cloud/VPN MTUs. MediaMTX logs from
+        # unstable deployments often show "RTP packets are too big (1460 > 1440)";
+        # 1200-byte packets avoid fragmentation without changing video quality.
+        pkt_env = "PLAYBACK_WEBRTC_OUTPUT_PKT_SIZE" if self.is_playback_stream else "TRACKING_WEBRTC_OUTPUT_PKT_SIZE"
+        try:
+            self.output_pkt_size = int(os.environ.get(pkt_env, os.environ.get("WEBRTC_OUTPUT_PKT_SIZE", "1200")) or 0)
+        except Exception:
+            self.output_pkt_size = 1200
+
         self._stop_evt = threading.Event()
         self._ready_evt = threading.Event()
         self._done_evt = threading.Event()
@@ -290,13 +299,13 @@ class ProcessedFrameRtspPublisher:
 
     def _build_cmd(self, w: int, h: int) -> list[str]:
         fps_txt = f"{self.fps:.3f}"
-        return [
+        cmd = [
             self._resolve_ffmpeg_bin(),
             "-hide_banner",
+            "-nostdin",
             "-loglevel", "warning",
-            "-fflags", "+genpts+nobuffer",
-            "-flags", "low_delay",
-            "-thread_queue_size", "1",
+            "-fflags", "+genpts",
+            "-thread_queue_size", "2",
             "-f", "rawvideo",
             "-pix_fmt", "bgr24",
             "-s", f"{int(w)}x{int(h)}",
@@ -304,12 +313,16 @@ class ProcessedFrameRtspPublisher:
             "-i", "-",
             "-an",
             *self._codec_args(),
+            "-max_muxing_queue_size", "1024",
             "-muxdelay", "0",
             "-muxpreload", "0",
             "-f", "rtsp",
             "-rtsp_transport", "tcp",
-            self.rtsp_output,
         ]
+        if int(getattr(self, "output_pkt_size", 0) or 0) > 0:
+            cmd += ["-pkt_size", str(int(self.output_pkt_size))]
+        cmd += [self.rtsp_output]
+        return cmd
 
     @staticmethod
     def _draw_centered_text(img: np.ndarray, lines: list[str]) -> None:
@@ -965,6 +978,7 @@ class ProcessedFrameRtspPublisher:
             "placeholder_frames_published": int(self._placeholder_frames_published),
             "frames_dropped": int(self._frames_dropped),
             "ffmpeg_restarts": int(max(0, self._restarts - 1)),
+            "output_pkt_size": int(getattr(self, "output_pkt_size", 0) or 0),
             "last_error": self._last_error,
             "last_frame_ts": float(self._last_frame_ts),
             "last_processed_arrival_ts": float(self._latest_processed_arrival_ts),

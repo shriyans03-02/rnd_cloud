@@ -18,14 +18,11 @@ def start(
 ) -> embedding.StartResponse:
     try:
         res = embedding_service.start_extraction(
-    member_id=req.member_id,
-    camera_ids=req.camera_ids,
-    show_viewer=req.show_viewer,
-    clear_existing=req.clear_existing,
-)
-    except TypeError:
-        # If service doesn't have clear_existing param yet
-        res = embedding_service.start_extraction(req.member_id, req.camera_ids, req.show_viewer)
+            member_id=req.member_id,
+            camera_ids=req.camera_ids,
+            show_viewer=req.show_viewer,
+            clear_existing=req.clear_existing,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"start_extraction failed: {e}") from e
 
@@ -132,8 +129,8 @@ def preview_jpeg(
     server-side cv2.imshow.
     """
     jpg = embedding_service.get_preview_jpeg(camera_id=camera_id, jpeg_quality=jpeg_quality)
-    if jpg is None:
-        raise HTTPException(status_code=404, detail="No embedding preview frame available yet")
+    if not jpg:
+        jpg = b""
     return Response(content=jpg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 

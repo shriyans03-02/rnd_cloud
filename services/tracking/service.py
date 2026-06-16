@@ -1276,7 +1276,13 @@ class PlaybackCleanRestream:
             time.sleep(0.15)
         if self._proc is not None and self._proc.poll() is None:
             self._error = f"playback clean restream alive but RTSP path was not ready before timeout: {self.rtsp_output}"
-            if _setting_bool("PLAYBACK_CLEAN_RESTREAM_ALLOW_SLOW_READY", True):
+            # Do not let the AI reader open playback_clean_* while MediaMTX is
+            # still returning 404.  That caused endless reconnect loops and low
+            # AI FPS in playback.  Strict-ready is the safe default: start_session
+            # will either wait longer (via PLAYBACK_CLEAN_RESTREAM_WARMUP_SECONDS)
+            # or fall back to the raw NVR URL when fallback is enabled.
+            strict_ready = _setting_bool("PLAYBACK_CLEAN_RESTREAM_STRICT_READY", True)
+            if (not strict_ready) and _setting_bool("PLAYBACK_CLEAN_RESTREAM_ALLOW_SLOW_READY", False):
                 try:
                     print(f"[PLAYBACK-CLEAN][WARN] {self._error}; continuing and letting the reader reconnect")
                 except Exception:
@@ -2009,14 +2015,24 @@ class PlaybackTracingService:
         if not str(getattr(settings, "MEDIAMTX_RTSP", "") or "").strip():
             raise RuntimeError("MEDIAMTX_RTSP is required for annotated HLS playback.")
 
-        # Avoid duplicated tracing sessions for the same exact request.
-        for old_session_id in self._matching_session_ids(
-            camera_id=int(camera_id),
-            request_mode=str(mode),
-            member_id=member_id,
-            member_name=member_name_clean,
-        ):
-            self.stop_session(old_session_id)
+        # Playback is a finite, user-driven action.  Replace old playback sessions
+        # before starting a new one so stale playback_clean_* readers/publishers do
+        # not keep reconnecting to deleted MediaMTX paths.  This is intentionally
+        # playback-only and does not affect live AI workers.
+        if _setting_bool("PLAYBACK_STOP_ALL_BEFORE_START", True):
+            try:
+                self.stop_all()
+            except Exception:
+                pass
+        else:
+            # Avoid duplicated tracing sessions for the same exact request.
+            for old_session_id in self._matching_session_ids(
+                camera_id=int(camera_id),
+                request_mode=str(mode),
+                member_id=member_id,
+                member_name=member_name_clean,
+            ):
+                self.stop_session(old_session_id)
 
         # Keep playback tracing bounded.  A second playback request should replace
         # the existing one instead of starting another model stack and competing
@@ -2055,7 +2071,11 @@ class PlaybackTracingService:
             )
             try:
                 clean_restream.start()
-                if not clean_restream.wait_until_ready():
+                clean_ready_timeout = _setting_float(
+                    "PLAYBACK_CLEAN_RESTREAM_READY_TIMEOUT_SECONDS",
+                    _setting_float("PLAYBACK_CLEAN_RESTREAM_WARMUP_SECONDS", 10.0),
+                )
+                if not clean_restream.wait_until_ready(timeout=clean_ready_timeout):
                     err = clean_restream.error() or "clean restream did not stay alive"
                     clean_restream.stop()
                     if _setting_bool("PLAYBACK_CLEAN_RESTREAM_FALLBACK_TO_RAW_ON_ERROR", True):

@@ -8487,9 +8487,17 @@ def build_galleries_from_db(db_url: str, active_only: bool = True, max_bank_per_
             .join(MemberRow, MemberRow.id == MemberEmbeddingRow.member_id)
         )
         rows = session.execute(stmt).all()
+        skipped_bad_camera_id = 0
         for r in rows:
             mid = int(r.member_id)
-            cam_id = int(r.camera_id)
+            raw_cam_id = getattr(r, "camera_id", None)
+            cam_id = None
+            if raw_cam_id is not None:
+                try:
+                    cam_id = int(raw_cam_id)
+                except Exception:
+                    skipped_bad_camera_id += 1
+                    cam_id = None
             first = str(r.first_name or "").strip()
             last = str(r.last_name or "").strip()
             name = (first + " " + last).strip() if last else first
@@ -8524,7 +8532,11 @@ def build_galleries_from_db(db_url: str, active_only: bool = True, max_bank_per_
                 body_bank = body_cent.reshape(1, -1).astype(np.float32)
             if body_bank is not None and body_bank.ndim == 2 and body_bank.shape[1] == EXPECTED_DIM:
                 body_bank = l2_normalize_rows(body_bank.astype(np.float32))
-            people_by_cam[cam_id].append(PersonEntry(mid, name, cam_id, body_bank, body_cent))
+            if cam_id is not None:
+                people_by_cam[int(cam_id)].append(PersonEntry(mid, name, int(cam_id), body_bank, body_cent))
+            elif body_bank is not None or body_cent is not None:
+                skipped_bad_camera_id += 1
+            # Face embeddings are global member identities; they must still load even when camera_id is NULL.
             if face_cent is not None:
                 face_vecs_by_member[mid].append(face_cent.astype(np.float32))
 
@@ -8542,7 +8554,11 @@ def build_galleries_from_db(db_url: str, active_only: bool = True, max_bank_per_
     face_mat = l2_normalize_rows(np.stack(fg_vecs, axis=0)) if fg_vecs else np.zeros((0, EXPECTED_DIM), dtype=np.float32)
     face_gallery = FaceGallery(fg_member_ids, fg_names, face_mat)
     total_body_entries = sum(len(v) for v in people_by_cam.values())
+    if 'skipped_bad_camera_id' in locals() and skipped_bad_camera_id:
+        print(f"[DB][WARN] skipped body gallery rows with missing/invalid camera_id: {skipped_bad_camera_id}")
     print(f"[DB] Loaded member_embeddings: body_entries={total_body_entries} | face_identities={len(fg_names)}")
+    if len(fg_names) == 0:
+        print("[DB][WARN] Face gallery is empty. InsightFace can detect faces, but identity matching will not happen until face embeddings are saved in member_embeddings.face_embedding or face_embeddings_raw.")
     return people_by_cam, face_gallery, name_to_member_id
 
 
@@ -8594,25 +8610,97 @@ def _tracking_soft_start_enabled() -> bool:
     )
 
 
-def _build_direct_rtsp_url_from_ip(ip: str) -> str:
+def _encode_rtsp_component(value: str) -> str:
+    """Accept either raw or already URL-encoded RTSP credentials."""
+    return quote(unquote(str(value or "")), safe="")
+
+
+def _parse_live_channel_map() -> Dict[int, str]:
+    result: Dict[int, str] = {}
+    raw = os.environ.get("CHANNEL_MAP", "")
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or ":" not in pair:
+            continue
+        cam_id, channel = pair.split(":", 1)
+        try:
+            result[int(cam_id.strip())] = channel.strip()
+        except ValueError:
+            continue
+    return result
+
+
+def _resolve_live_rtsp_channel(camera_id: int | None = None) -> str:
+    source = _env_first("RTSP_CHANNEL_SOURCE", default="env").strip().lower()
+    if source in {"camera_id", "id", "camera"} and camera_id is not None:
+        return str(camera_id)
+    if source in {"channel_map", "map", "mapped"} and camera_id is not None:
+        mapped = _parse_live_channel_map().get(int(camera_id))
+        if mapped:
+            return str(mapped)
+    return _env_first("RTSP_CHANNEL", default="1") or "1"
+
+
+def _hikvision_stream_suffix(subtype: str) -> str:
+    subtype_s = str(subtype or "0").strip().lower()
+    if subtype_s in {"main", "mainstream", "primary"}:
+        return "01"
+    if subtype_s in {"sub", "substream", "secondary"}:
+        return "02"
+    try:
+        return f"{int(subtype_s) + 1:02d}"
+    except Exception:
+        return "01"
+
+
+def _build_live_channel_stream(channel: str, subtype: str, explicit_stream: str = "") -> str:
+    stream = str(explicit_stream or "").strip()
+    if stream:
+        return stream
+    channel_s = str(channel or "1").strip() or "1"
+    if channel_s.isdigit() and int(channel_s) >= 100:
+        return channel_s
+    return f"{channel_s}{_hikvision_stream_suffix(subtype)}"
+
+
+def _build_direct_rtsp_url_from_ip(ip: str, camera_id: int | None = None, camera_name: str = "") -> str:
+    ip = str(ip or "").strip()
+    if ip.lower().startswith(("rtsp://", "rtsps://")):
+        return ip
+
     template = _env_first(
         "RTSP_URL_TEMPLATE",
-        default="rtsp://{username}:{password}@{ip}:{port}/cam/realmonitor?channel={channel}&subtype={subtype}",
+        default="rtsp://{username}:{password}@{ip}:{port}/Streaming/channels/{channel_stream}",
     )
+    subtype = _env_first("RTSP_SUBTYPE", default="0") or "0"
+    channel = _resolve_live_rtsp_channel(camera_id)
+    explicit_stream = _env_first("RTSP_STREAM", default="")
+    channel_stream = _build_live_channel_stream(channel, subtype, explicit_stream)
+    path = _env_first("RTSP_PATH", default="/Streaming/channels") or "/Streaming/channels"
+    if path and not path.startswith("/"):
+        path = "/" + path
+    path = path.rstrip("/")
+
     vals = {
-        "ip": str(ip),
-        "username": _env_first("RTSP_USER", default="admin"),
-        "password": _env_first("RTSP_PASS", default=""),
-        "port": _env_first("RTSP_PORT", default="554"),
-        "path": _env_first("RTSP_PATH", default="/cam/realmonitor"),
-        "channel": _env_first("RTSP_CHANNEL", default="1"),
-        "subtype": _env_first("RTSP_SUBTYPE", default="0"),
-        "stream": _env_first("RTSP_STREAM", default=""),
+        "scheme": _env_first("RTSP_SCHEME", default="rtsp") or "rtsp",
+        "ip": ip,
+        "username": _encode_rtsp_component(_env_first("RTSP_USERNAME", "RTSP_USER", default="admin")),
+        "user": _encode_rtsp_component(_env_first("RTSP_USERNAME", "RTSP_USER", default="admin")),
+        "password": _encode_rtsp_component(_env_first("RTSP_PASSWORD", "RTSP_PASS", default="")),
+        "port": _env_first("RTSP_PORT", default="554") or "554",
+        "path": path,
+        "camera_id": int(camera_id) if camera_id is not None else "",
+        "id": int(camera_id) if camera_id is not None else "",
+        "name": str(camera_name or ""),
+        "channel": channel,
+        "subtype": subtype,
+        "stream": explicit_stream or channel_stream,
+        "channel_stream": channel_stream,
     }
     try:
         return template.format(**vals)
     except Exception:
-        return f"rtsp://{vals['username']}:{vals['password']}@{ip}:{vals['port']}{vals['path']}?channel={vals['channel']}&subtype={vals['subtype']}"
+        return f"{vals['scheme']}://{vals['username']}:{vals['password']}@{ip}:{vals['port']}{path}/{channel_stream}"
 
 
 def resolve_auto_db_camera_sources(args: argparse.Namespace) -> argparse.Namespace:
@@ -8713,7 +8801,7 @@ def resolve_auto_db_camera_sources(args: argparse.Namespace) -> argparse.Namespa
         ip = str(row.get("ip") or "")
         name = str(row.get("name") or f"Camera {cam_id}")
         if mode == "direct":
-            src = _build_direct_rtsp_url_from_ip(ip)
+            src = _build_direct_rtsp_url_from_ip(ip, camera_id=cam_id, camera_name=name)
         elif mode == "mediamtx":
             src = f"{prefix}{idx}"
         elif mode == "mediamtx-ai-id":
@@ -10543,50 +10631,103 @@ class BatchedYoloRunner:
                         pass
                     j.event.set()
 
+def _ort_available_providers_safe() -> List[str]:
+    if ort is None:
+        return []
+    try:
+        return list(ort.get_available_providers())
+    except Exception:
+        return []
+
+
+def _create_face_analysis(face_model: str, providers: list):
+    """Create InsightFace with only detector + recognition modules when supported."""
+    try:
+        return FaceAnalysis(
+            name=str(face_model or "buffalo_l"),
+            providers=providers,
+            allowed_modules=["detection", "recognition"],
+        )
+    except TypeError:
+        return FaceAnalysis(name=str(face_model or "buffalo_l"), providers=providers)
+
+
+def _prepare_face_analysis(app, ctx_id: int, det_w: int, det_h: int):
+    det_w = max(160, int(det_w or 640))
+    det_h = max(160, int(det_h or 640))
+    try:
+        app.prepare(ctx_id=int(ctx_id), det_size=(det_w, det_h))
+    except TypeError:
+        app.prepare(ctx_id=int(ctx_id))
+
+
+def _face_warmup(app) -> None:
+    """Force ONNX sessions to initialize now, not on the first live frame."""
+    try:
+        dummy = np.zeros((320, 320, 3), dtype=np.uint8)
+        _ = app.get(dummy)
+    except Exception as e:
+        raise RuntimeError(f"InsightFace warmup failed: {e}") from e
+
+
 def init_face_engine(use_face: bool, device: str, face_model: str, det_w: int, det_h: int, face_provider: str, ort_log: bool):
     if not use_face:
+        print("[INIT] InsightFace disabled (--use-face is false).")
         return None
-    if not INSIGHT_OK:
-        print("[WARN] insightface not installed; face recognition disabled.")
+    if not INSIGHT_OK or FaceAnalysis is None:
+        print("[WARN] insightface import failed; face recognition disabled. Run: pip install insightface onnxruntime-gpu")
         return None
-    try:
-        is_cuda = ("cuda" in device.lower()) and torch.cuda.is_available()
-        cuda_ok = _cuda_ep_loadable()
-        if ort is not None and ort_log:
-            try:
-                print(f"[INFO] ORT available providers: {ort.get_available_providers()}")
-            except Exception:
-                pass
-        providers = ["CPUExecutionProvider"]
-        cuda_provider = (
-            "CUDAExecutionProvider",
-            {
-                "device_id": "0",
-                "enable_cuda_graph": "0",
-                "do_copy_in_default_stream": "1",
-                "cudnn_conv_algo_search": "HEURISTIC",
-            },
-        )
-        if face_provider == "cuda":
-            if cuda_ok:
-                providers = [cuda_provider, "CPUExecutionProvider"]
-            else:
-                print("[INFO] Requested CUDA EP, but not loadable. Using CPU.")
-        elif face_provider == "auto":
-            if is_cuda and cuda_ok:
-                providers = [cuda_provider, "CPUExecutionProvider"]
-        app = FaceAnalysis(name=face_model, providers=providers)
-        first_provider = providers[0][0] if isinstance(providers[0], tuple) else str(providers[0])
-        ctx_id = 0 if first_provider.startswith("CUDA") else -1
+
+    requested = str(face_provider or "auto").strip().lower()
+    device_s = str(device or "").strip().lower()
+    available = _ort_available_providers_safe()
+    if ort_log:
+        print(f"[INFO] ORT available providers: {available}")
         try:
-            app.prepare(ctx_id=ctx_id, det_size=(det_w, det_h))
-        except TypeError:
-            app.prepare(ctx_id=ctx_id)
-        print(f"[INIT] InsightFace ready (model={face_model}, providers={providers}).")
-        return app
-    except Exception as e:
-        print("[WARN] InsightFace init failed:", e)
-        return None
+            print(f"[INFO] torch.cuda.is_available={torch.cuda.is_available()} device_count={torch.cuda.device_count()}")
+        except Exception:
+            pass
+
+    cuda_provider = (
+        "CUDAExecutionProvider",
+        {
+            "device_id": "0",
+            "enable_cuda_graph": "0",
+            "do_copy_in_default_stream": "1",
+            "cudnn_conv_algo_search": "HEURISTIC",
+        },
+    )
+    cpu_provider = "CPUExecutionProvider"
+
+    want_cuda = requested == "cuda" or (requested == "auto" and "cuda" in device_s)
+    cuda_ok = (
+        want_cuda
+        and torch.cuda.is_available()
+        and "CUDAExecutionProvider" in available
+        and _cuda_ep_loadable()
+    )
+
+    provider_attempts = []
+    if cuda_ok:
+        provider_attempts.append(([cuda_provider, cpu_provider], 0, "cuda"))
+    elif requested == "cuda":
+        print("[WARN] InsightFace CUDA requested but CUDAExecutionProvider is not loadable; falling back to CPU.")
+    provider_attempts.append(([cpu_provider], -1, "cpu"))
+
+    last_error = None
+    for providers, ctx_id, label in provider_attempts:
+        try:
+            app = _create_face_analysis(face_model, providers)
+            _prepare_face_analysis(app, ctx_id=ctx_id, det_w=det_w, det_h=det_h)
+            _face_warmup(app)
+            print(f"[INIT] InsightFace ready model={face_model} provider={label} providers={providers} det_size=({int(det_w)}, {int(det_h)})")
+            return app
+        except Exception as e:
+            last_error = e
+            print(f"[WARN] InsightFace init failed with provider={label}: {e}")
+
+    print(f"[ERROR] InsightFace disabled after all provider attempts failed. last_error={last_error}")
+    return None
 
 
 def _yolo_forward_safe(yolo, frame, args):

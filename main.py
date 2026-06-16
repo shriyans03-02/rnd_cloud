@@ -3,14 +3,15 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import os
-# Force synchronous execution to prevent thread race conditions on the GPU
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-# Disable implicit torch backend graph profiling
-os.environ["TORCH_CUDAGRAPH_ENABLE"] = "0"
+# CUDA_LAUNCH_BLOCKING=1 is useful for debugging crashes, but it serializes CUDA
+# work and makes embedding extraction much slower.  Leave it off unless the env
+# explicitly asks for it.
+if os.getenv("FORCE_CUDA_LAUNCH_BLOCKING", "0").strip().lower() in {"1", "true", "yes", "on"}:
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ.setdefault("TORCH_CUDAGRAPH_ENABLE", "0")
 
 import torch
-# Disable PyTorch's internal benchmarking allocator which breaks multi-threading
-torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.benchmark = os.getenv("TORCH_CUDNN_BENCHMARK", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 class NormalizeDuplicateV1Middleware:
     """Normalize accidental duplicate API prefixes from the frontend.
@@ -49,7 +50,7 @@ app.add_middleware(NormalizeDuplicateV1Middleware)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://100.111.17.5:5173", "https://cbt-reid-admin-ui.onrender.com","http://164.52.214.233:5173"],
+    allow_origins=["http://100.111.17.5:5173", "https://cbt-reid-admin-ui.onrender.com","http://164.52.214.233:5173","http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

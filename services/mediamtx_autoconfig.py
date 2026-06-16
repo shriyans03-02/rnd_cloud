@@ -3,11 +3,14 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+from urllib.parse import quote, unquote
 
 from sqlalchemy import Boolean, Column, Integer, String, create_engine, select
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.core.config import settings
+from app.db.models.camera import Camera
+from app.services.rtsp_url_builder import RTSPTemplateError, build_camera_live_rtsp_url
 
 
 def _env(name: str, default: str = "") -> str:
@@ -30,23 +33,75 @@ def _quote_yaml(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def build_camera_rtsp_url(ip: str) -> str:
-    template = _env("RTSP_URL_TEMPLATE", "rtsp://{username}:{password}@{ip}:{port}/cam/realmonitor?channel={channel}&subtype={subtype}")
-    vals = {
-        "scheme": _env("RTSP_SCHEME", "rtsp"),
-        "username": _env("RTSP_USERNAME", "") or _env("RTSP_USER", "admin"),
-        "password": _env("RTSP_PASSWORD", "") or _env("RTSP_PASS", ""),
-        "ip": str(ip or "").strip(),
-        "port": _env("RTSP_PORT", "554"),
-        "path": _env("RTSP_PATH", "/cam/realmonitor"),
-        "channel": _env("RTSP_CHANNEL", "1"),
-        "subtype": _env("RTSP_SUBTYPE", "0"),
-        "stream": _env("RTSP_STREAM", ""),
-    }
+def _encode_url_component(value: str) -> str:
+    """Accept either raw or already URL-encoded credentials."""
+    return quote(unquote(str(value or "")), safe="")
+
+
+def _parse_channel_map() -> Dict[int, str]:
+    result: Dict[int, str] = {}
+    raw = _env("CHANNEL_MAP", "")
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or ":" not in pair:
+            continue
+        cam_id, channel = pair.split(":", 1)
+        try:
+            result[int(cam_id.strip())] = channel.strip()
+        except ValueError:
+            continue
+    return result
+
+
+def _resolve_rtsp_channel(camera_id: int | None = None) -> str:
+    source = _env("RTSP_CHANNEL_SOURCE", "env").strip().lower()
+    if source in {"camera_id", "id", "camera"} and camera_id is not None:
+        return str(camera_id)
+    if source in {"channel_map", "map", "mapped"} and camera_id is not None:
+        mapped = _parse_channel_map().get(int(camera_id))
+        if mapped:
+            return str(mapped)
+    return _env("RTSP_CHANNEL", "1").strip() or "1"
+
+
+def _hikvision_suffix_from_subtype(subtype: str) -> str:
+    subtype_s = str(subtype or "0").strip().lower()
+    if subtype_s in {"main", "mainstream", "primary"}:
+        return "01"
+    if subtype_s in {"sub", "substream", "secondary"}:
+        return "02"
     try:
-        return template.format(**vals)
+        # Existing config uses 0 for main stream and 1 for sub stream.
+        return f"{int(subtype_s) + 1:02d}"
     except Exception:
-        return f"rtsp://{vals['username']}:{vals['password']}@{vals['ip']}:{vals['port']}{vals['path']}?channel={vals['channel']}&subtype={vals['subtype']}"
+        return "01"
+
+
+def _build_channel_stream(channel: str, subtype: str, explicit_stream: str = "") -> str:
+    stream = str(explicit_stream or "").strip()
+    if stream:
+        return stream
+
+    channel_s = str(channel or "1").strip() or "1"
+    # Allow CHANNEL_MAP/RTSP_CHANNEL to contain a complete Hikvision stream id like 101 or 1201.
+    if channel_s.isdigit() and int(channel_s) >= 100:
+        return channel_s
+
+    return f"{channel_s}{_hikvision_suffix_from_subtype(subtype)}"
+
+
+def build_camera_rtsp_url(ip: str, camera_id: int | None = None, camera_name: str = "") -> str:
+    """Compatibility wrapper.
+
+    Live RTSP URLs are now generated from the full Camera DB row by
+    build_camera_live_rtsp_url(). This wrapper only returns full RTSP URLs that
+    are already stored in cameras.ip_address; it no longer builds from env
+    templates.
+    """
+    ip = str(ip or "").strip()
+    if ip.lower().startswith(("rtsp://", "rtsps://")):
+        return ip
+    return ""
 
 
 def load_active_cameras_from_db() -> List[Dict[str, Any]]:
@@ -54,32 +109,40 @@ def load_active_cameras_from_db() -> List[Dict[str, Any]]:
     if not db_url:
         raise RuntimeError("DATABASE_URL is empty; cannot generate MediaMTX camera paths")
 
-    BaseLocal = declarative_base()
-
-    class CameraRow(BaseLocal):
-        __tablename__ = "cameras"
-        id = Column(Integer, primary_key=True)
-        name = Column(String)
-        ip_address = Column(String)
-        is_active = Column(Boolean)
-
     engine = create_engine(db_url, pool_pre_ping=True)
     Session = sessionmaker(bind=engine)
     rows: List[Dict[str, Any]] = []
     try:
         with Session() as session:
-            for r in session.execute(select(CameraRow.id, CameraRow.name, CameraRow.ip_address, CameraRow.is_active)).all():
+            cameras = (
+                session.query(Camera)
+                .filter(Camera.is_active.is_(True))
+                .order_by(Camera.id.asc())
+                .all()
+            )
+            for cam in cameras:
                 try:
-                    cam_id = int(r[0])
+                    cam_id = int(cam.id)
                 except Exception:
                     continue
-                active = bool(r[3]) if r[3] is not None else True
-                if not active:
-                    continue
-                ip = str(r[2] or "").strip()
+                ip = str(getattr(cam, "ip_address", "") or "").strip()
                 if not ip:
                     continue
-                rows.append({"id": cam_id, "name": str(r[1] or f"Camera {cam_id}"), "ip_address": ip})
+                try:
+                    source_url = build_camera_live_rtsp_url(cam)
+                except RTSPTemplateError as exc:
+                    print(f"[MEDIAMTX-AUTO] skipping camera {cam_id}: {exc}")
+                    continue
+                rows.append(
+                    {
+                        "id": cam_id,
+                        "name": str(getattr(cam, "name", None) or f"Camera {cam_id}"),
+                        "ip_address": ip,
+                        "rtsp_source": source_url,
+                        "source_type": "camera",
+                        "nvr_id": getattr(cam, "nvr_id", None),
+                    }
+                )
     finally:
         try:
             engine.dispose()
@@ -93,6 +156,16 @@ def build_mediamtx_config(cameras: List[Dict[str, Any]]) -> str:
     public_ip = _env("MEDIAMTX_PUBLIC_IP", "").strip() or _env("PUBLIC_IP", "").strip() or "164.52.214.233"
     write_queue = _env("MEDIAMTX_WRITE_QUEUE_SIZE", "256")
     source_on_demand = _bool_env("MEDIAMTX_SOURCE_ON_DEMAND", False)
+    # In direct restream mode, FFmpeg already pulls the camera/NVR directly and
+    # publishes ai/cam<ID>. Keeping live/cam<ID> always-on doubles the inbound
+    # H265 traffic and makes cloud RTP packet loss much worse. Keep live paths
+    # available, but start them only when someone explicitly reads live/cam<ID>.
+    if (
+        _bool_env("NVDEC_RESTREAM_ENABLED", False)
+        and _env("NVDEC_RESTREAM_INPUT_MODE", "direct").strip().lower() == "direct"
+        and _bool_env("MEDIAMTX_FORCE_ON_DEMAND_WITH_DIRECT_RESTREAM", True)
+    ):
+        source_on_demand = True
     on_demand_str = "yes" if source_on_demand else "no"
     rtsp_transport = _env("MEDIAMTX_CAMERA_RTSP_TRANSPORT", "tcp") or "tcp"
 
@@ -166,9 +239,14 @@ def build_mediamtx_config(cameras: List[Dict[str, Any]]) -> str:
         cam_id = int(cam["id"])
         name = str(cam.get("name") or f"Camera {cam_id}")
         ip = str(cam.get("ip_address") or "")
-        url = build_camera_rtsp_url(ip)
+        url = str(cam.get("rtsp_source") or "").strip()
+        if not url:
+            url = build_camera_rtsp_url(ip, camera_id=cam_id, camera_name=name)
+        if not url:
+            print(f"[MEDIAMTX-AUTO] skipping live/cam{cam_id}: no RTSP source URL built from DB")
+            continue
         lines.append(f"  live/cam{cam_id}:")
-        lines.append(f"    # {name} | {ip}")
+        lines.append(f"    # {name} | {ip} | source={cam.get('source_type', 'direct')}")
         lines.append(f"    source: {_quote_yaml(url)}")
         lines.append(f"    rtspTransport: {rtsp_transport}")
         if source_on_demand:

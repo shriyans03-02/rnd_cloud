@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import os
+import csv
+import sys
+import json
+import hashlib
 from dotenv import load_dotenv
 from pathlib import Path
 import time
@@ -18,6 +22,9 @@ import re
 import inspect
 from contextlib import contextmanager
 from typing import Generator
+from urllib.parse import quote, unquote
+
+from sqlalchemy.orm import joinedload
 
 import cv2
 import numpy as np
@@ -34,6 +41,7 @@ from app.core.constants import (
 )
 from app.db.session import get_db, engine  # engine kept for compatibility
 from app.db.models import Member, MemberEmbedding
+from app.services.rtsp_url_builder import RTSPTemplateError, build_camera_live_rtsp_url
 
 try:
     from app.db.models import Camera
@@ -43,6 +51,55 @@ except Exception:
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(BASE_DIR / ".env")
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int, *, min_value: Optional[int] = None, max_value: Optional[int] = None) -> int:
+    try:
+        value = int(str(os.getenv(name, str(default))).strip())
+    except Exception:
+        value = int(default)
+    if min_value is not None:
+        value = max(int(min_value), value)
+    if max_value is not None:
+        value = min(int(max_value), value)
+    return value
+
+
+def _env_float(name: str, default: float, *, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
+    try:
+        value = float(str(os.getenv(name, str(default))).strip())
+    except Exception:
+        value = float(default)
+    if min_value is not None:
+        value = max(float(min_value), value)
+    if max_value is not None:
+        value = min(float(max_value), value)
+    return value
+
+
+def _env_list(name: str, default: str) -> List[str]:
+    raw = os.getenv(name, default)
+    items = [p.strip() for p in str(raw).replace(";", ",").split(",") if p.strip()]
+    return items or [p.strip() for p in str(default).split(",") if p.strip()]
+
+
+def _env_size(name: str, default: Tuple[int, int]) -> Tuple[int, int]:
+    raw = str(os.getenv(name, "")).strip()
+    if raw:
+        parts = [p for p in re.split(r"[xX,\s]+", raw) if p]
+        if len(parts) >= 2:
+            try:
+                return max(64, int(parts[0])), max(64, int(parts[1]))
+            except Exception:
+                pass
+    return int(default[0]), int(default[1])
 
 # ===================== DB Session Wrapper =====================
 
@@ -129,35 +186,51 @@ except Exception:
 
 EXPECTED_EMBED_DIM = 512
 
-RAW_STORE_LIMIT = int(os.getenv("RAW_STORE_LIMIT", "256"))
+RAW_STORE_LIMIT = _env_int("RAW_STORE_LIMIT", 256, min_value=1)
 
-USE_FACE = True
-FACE_MODEL = "buffalo_l"
-FACE_DET_SIZE = (1280, 1280)
-FACE_PROVIDER = "auto"
-FACE_MIN_SCORE = 0.5
-FACE_MIN_SIZE = 32
+# Fast mode avoids the biggest latency multipliers for normal gallery builds:
+# two ReID models, horizontal TTA, full-body face scans, and ReID on back-body
+# crops.  Set EMBEDDING_FAST_MODE=False to restore the heavier ensemble style.
+EMBEDDING_FAST_MODE = _env_bool("EMBEDDING_FAST_MODE", True)
+
+USE_FACE = _env_bool("EMBEDDING_USE_FACE", True)
+FACE_MODEL = os.getenv("EMBEDDING_FACE_MODEL", os.getenv("FACE_MODEL", "buffalo_l")).strip() or "buffalo_l"
+FACE_DET_SIZE = _env_size(
+    "EMBEDDING_FACE_DET_SIZE",
+    (640, 640) if EMBEDDING_FAST_MODE else (1280, 1280),
+)
+FACE_PROVIDER = os.getenv("EMBEDDING_FACE_PROVIDER", os.getenv("FACE_PROVIDER", "auto")).strip().lower() or "auto"
+FACE_MIN_SCORE = _env_float("EMBEDDING_FACE_MIN_SCORE", 0.5, min_value=0.0, max_value=1.0)
+FACE_MIN_SIZE = _env_int("EMBEDDING_FACE_MIN_SIZE", 32, min_value=1)
 FACE_IOU_LINK = 0.05
 FACE_OVER_FACE_LINK = 0.60
-FACE_EVERY = int(os.getenv("FACE_EVERY", "1"))
+FACE_EVERY = _env_int("EMBEDDING_FACE_EVERY", _env_int("FACE_EVERY", 1, min_value=1), min_value=1)
+FACE_SCAN_TOP_RATIO = _env_float("EMBEDDING_FACE_SCAN_TOP_RATIO", 0.65, min_value=0.2, max_value=1.0)
+FACE_MAX_SIDE = _env_int("EMBEDDING_FACE_MAX_SIDE", 512 if EMBEDDING_FAST_MODE else 640, min_value=128, max_value=1280)
 
-YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "1280"))
+YOLO_IMGSZ = _env_int("EMBEDDING_YOLO_IMGSZ", _env_int("YOLO_IMGSZ", 960 if EMBEDDING_FAST_MODE else 1280, min_value=160), min_value=160)
 
-CAP_QUEUE_MAX = int(os.getenv("CAP_QUEUE_MAX", "2"))
-IO_QUEUE_MAX = int(os.getenv("IO_QUEUE_MAX", "1024"))
+CAP_QUEUE_MAX = _env_int("CAP_QUEUE_MAX", 2, min_value=1)
+IO_QUEUE_MAX = _env_int("IO_QUEUE_MAX", 1024, min_value=16)
 
-VIEWER_SLEEP_MS = int(os.getenv("VIEWER_SLEEP_MS", "5"))
+VIEWER_SLEEP_MS = _env_int("VIEWER_SLEEP_MS", 5, min_value=1)
 
-REID_MODELS = ["osnet_x1_0", "osnet_x0_25"]
-BODY_TTA_FLIP = True
-FACE_TTA_FLIP = True
+REID_MODELS = _env_list(
+    "EMBEDDING_REID_MODELS",
+    "osnet_x0_25" if EMBEDDING_FAST_MODE else "osnet_x1_0,osnet_x0_25",
+)
+BODY_TTA_FLIP = _env_bool("EMBEDDING_BODY_TTA_FLIP", not EMBEDDING_FAST_MODE)
+FACE_TTA_FLIP = _env_bool("EMBEDDING_FACE_TTA_FLIP", not EMBEDDING_FAST_MODE)
+REID_BATCH_SIZE_GPU = _env_int("EMBEDDING_REID_BATCH_SIZE_GPU", 128 if EMBEDDING_FAST_MODE else 64, min_value=1)
+REID_BATCH_SIZE_CPU = _env_int("EMBEDDING_REID_BATCH_SIZE_CPU", 32, min_value=1)
 
 BACK_BODY_GALLERY_NAME = "gallery_body"
-BACK_HEAD_CUT_RATIO = float(os.getenv("BACK_HEAD_CUT_RATIO", "0.0"))
-BACK_SHAPE_SEED = int(os.getenv("BACK_SHAPE_SEED", "1337"))
+BACK_HEAD_CUT_RATIO = _env_float("BACK_HEAD_CUT_RATIO", 0.0, min_value=0.0, max_value=0.45)
+BACK_SHAPE_SEED = _env_int("BACK_SHAPE_SEED", 1337)
 
-BACK_REID_WEIGHT = float(os.getenv("BACK_REID_WEIGHT", "0.65"))
-BACK_SHAPE_WEIGHT = float(os.getenv("BACK_SHAPE_WEIGHT", "0.35"))
+BACK_BODY_USE_REID = _env_bool("EMBEDDING_BACK_BODY_USE_REID", not EMBEDDING_FAST_MODE)
+BACK_REID_WEIGHT = _env_float("BACK_REID_WEIGHT", 0.65, min_value=0.0)
+BACK_SHAPE_WEIGHT = _env_float("BACK_SHAPE_WEIGHT", 0.35, min_value=0.0)
 
 BACK_HOG_WIN = (64, 128)
 BACK_HOG_BLOCK = (16, 16)
@@ -165,19 +238,22 @@ BACK_HOG_STRIDE = (8, 8)
 BACK_HOG_CELL = (8, 8)
 BACK_HOG_BINS = 9
 
-SAVE_MIN_INTERVAL_MS = int(os.getenv("SAVE_MIN_INTERVAL_MS", "200"))
-SAVE_MAX_DETS_PER_FRAME = int(os.getenv("SAVE_MAX_DETS_PER_FRAME", "3"))
-JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "85"))
+SAVE_MIN_INTERVAL_MS = _env_int("SAVE_MIN_INTERVAL_MS", 200, min_value=1)
+SAVE_MAX_DETS_PER_FRAME = _env_int("SAVE_MAX_DETS_PER_FRAME", 3, min_value=1)
+JPEG_QUALITY = _env_int("JPEG_QUALITY", 85, min_value=30, max_value=95)
 
-YOLO_REQ_QUEUE_MAX = int(os.getenv("YOLO_REQ_QUEUE_MAX", "64"))
-YOLO_BATCH_MAX = int(os.getenv("YOLO_BATCH_MAX", "8"))
-YOLO_BATCH_WAIT_MS = int(os.getenv("YOLO_BATCH_WAIT_MS", "10"))
-YOLO_RESP_TIMEOUT_S = float(os.getenv("YOLO_RESP_TIMEOUT_S", "0.7"))
+YOLO_REQ_QUEUE_MAX = _env_int("YOLO_REQ_QUEUE_MAX", 64, min_value=1)
+YOLO_BATCH_MAX = _env_int("YOLO_BATCH_MAX", 8, min_value=1)
+YOLO_BATCH_WAIT_MS = _env_int("YOLO_BATCH_WAIT_MS", 10, min_value=0)
+YOLO_RESP_TIMEOUT_S = _env_float("YOLO_RESP_TIMEOUT_S", 0.7, min_value=0.05)
 
-MAX_BODY_IMAGES = int(os.getenv("MAX_BODY_IMAGES", "600"))
-MAX_FACE_IMAGES = int(os.getenv("MAX_FACE_IMAGES", "600"))
-MAX_BACK_BODY_IMAGES = int(os.getenv("MAX_BACK_BODY_IMAGES", "600"))
-GALLERY_SAMPLE_SEED = int(os.getenv("GALLERY_SAMPLE_SEED", "1337"))
+MAX_BODY_IMAGES = _env_int("MAX_BODY_IMAGES", 600, min_value=0)
+MAX_FACE_IMAGES = _env_int("MAX_FACE_IMAGES", 600, min_value=0)
+MAX_BACK_BODY_IMAGES = _env_int("MAX_BACK_BODY_IMAGES", 600, min_value=0)
+GALLERY_SAMPLE_SEED = _env_int("GALLERY_SAMPLE_SEED", 1337)
+EMBEDDING_CACHE_ENABLED = _env_bool("EMBEDDING_CACHE_ENABLED", True)
+EMBEDDING_REQUIRE_ALL_KINDS = _env_bool("EMBEDDING_REQUIRE_ALL_KINDS", False)
+EMBEDDING_BLUR_FILTER = _env_bool("EMBEDDING_BLUR_FILTER", True)
 
 # Debug aids (default off)
 DEBUG_SAVE_NO_DETS_EVERY_SEC = float(os.getenv("DEBUG_SAVE_NO_DETS_EVERY_SEC", "0"))  # 0 disables
@@ -185,30 +261,24 @@ DEBUG_LOG_NO_DET_EVERY = int(os.getenv("DEBUG_LOG_NO_DET_EVERY", "150"))
 
 # ===================== DB Camera -> RTSP =====================
 
-USE_DB_CAMERA_CONFIG = os.getenv("USE_DB_CAMERA_CONFIG", "1").lower() in ("1", "true", "yes", "y", "on")
-ONLY_ACTIVE_CAMERAS = os.getenv("ONLY_ACTIVE_CAMERAS", "1").lower() in ("1", "true", "yes", "y", "on")
+USE_DB_CAMERA_CONFIG = _env_bool("USE_DB_CAMERA_CONFIG", True)
+ONLY_ACTIVE_CAMERAS = _env_bool("ONLY_ACTIVE_CAMERAS", True)
 
-# Desired CP Plus / Dahua live format:
-# rtsp://admin:admin%40123@10.10.43.251:554/cam/realmonitor?channel=1&subtype=0
-#
-# In the cameras table, Camera.ip_address should contain only the IP, for example:
-# 192.168.1.161
-#
-# You can still store a full rtsp:// URL in Camera.ip_address; if you do, it is returned unchanged.
-RTSP_URL_TEMPLATE = os.getenv(
-    "RTSP_URL_TEMPLATE",
-    "rtsp://{username}:{password}@{ip}:{port}/cam/realmonitor?channel={channel}&subtype={subtype}",
-).strip()
+# Live RTSP URLs now come from the DB camera/NVR templates.
+# RTSP_URL_TEMPLATE is kept only for old deployments and is no longer used by
+# DB camera loading below.
+RTSP_URL_TEMPLATE = os.getenv("RTSP_URL_TEMPLATE", "").strip()
 
-RTSP_USERNAME = os.getenv("RTSP_USERNAME", os.getenv("RTSP_USER", "admin")).strip()
-RTSP_PASSWORD = os.getenv("RTSP_PASSWORD", os.getenv("RTSP_PASS", "admin%40123")).strip()
+RTSP_USERNAME = os.getenv("RTSP_USERNAME", os.getenv("RTSP_USER", "")).strip()
+RTSP_PASSWORD = os.getenv("RTSP_PASSWORD", os.getenv("RTSP_PASS", "")).strip()
 RTSP_PORT = os.getenv("RTSP_PORT", "554").strip()
-RTSP_PATH = os.getenv("RTSP_PATH", "/cam/realmonitor").strip() or "/cam/realmonitor"
+RTSP_PATH = os.getenv("RTSP_PATH", "/Streaming/channels").strip() or "/Streaming/channels"
 RTSP_SCHEME = os.getenv("RTSP_SCHEME", "rtsp").strip() or "rtsp"
 RTSP_CHANNEL = os.getenv("RTSP_CHANNEL", "1").strip() or "1"
 RTSP_SUBTYPE = os.getenv("RTSP_SUBTYPE", "0").strip() or "0"
+RTSP_CHANNEL_SOURCE = os.getenv("RTSP_CHANNEL_SOURCE", "env").strip().lower() or "env"
 
-# Kept for compatibility with your older Streaming/channels template.
+# Explicit Hikvision stream id, for example 101. Leave empty to build {channel}01.
 RTSP_STREAM = os.getenv("RTSP_STREAM", "").strip() or ""
 
 
@@ -234,6 +304,9 @@ csv_lock = threading.Lock()
 frames_lock = threading.Lock()
 
 latest_frames: Dict[int, np.ndarray] = {}
+latest_preview_jpegs: Dict[int, bytes] = {}
+latest_preview_ts: Dict[int, float] = {}
+latest_preview_overlays: Dict[int, Dict[str, Any]] = {}
 
 capture_threads: Dict[int, threading.Thread] = {}
 extract_threads: Dict[int, threading.Thread] = {}
@@ -263,10 +336,100 @@ _back_proj_in_dim = None
 
 OVERALL_CAMERA_ID = -1
 
-EMBEDDING_PREVIEW_FPS = float(os.getenv("EMBEDDING_PREVIEW_FPS", "8"))
-EMBEDDING_PREVIEW_JPEG_QUALITY = int(os.getenv("EMBEDDING_PREVIEW_JPEG_QUALITY", "80"))
-EMBEDDING_ENABLE_CV2_VIEWER = os.getenv("EMBEDDING_ENABLE_CV2_VIEWER", "0").strip().lower() in {"1", "true", "yes", "on", "y"}
+EMBEDDING_PREVIEW_FPS = _env_float("EMBEDDING_PREVIEW_FPS", 8.0, min_value=1.0, max_value=30.0)
+EMBEDDING_PREVIEW_RAW_FPS = _env_float("EMBEDDING_PREVIEW_RAW_FPS", 10.0, min_value=1.0, max_value=30.0)
+EMBEDDING_PREVIEW_ANNOTATED_FPS = _env_float("EMBEDDING_PREVIEW_ANNOTATED_FPS", EMBEDDING_PREVIEW_FPS, min_value=1.0, max_value=30.0)
+EMBEDDING_PREVIEW_JPEG_QUALITY = _env_int("EMBEDDING_PREVIEW_JPEG_QUALITY", 80, min_value=30, max_value=95)
+EMBEDDING_PREVIEW_MAX_WIDTH = _env_int("EMBEDDING_PREVIEW_MAX_WIDTH", 960, min_value=320, max_value=1920)
+EMBEDDING_PREVIEW_PLACEHOLDER_WIDTH = _env_int("EMBEDDING_PREVIEW_PLACEHOLDER_WIDTH", 960, min_value=320, max_value=1920)
+EMBEDDING_PREVIEW_PLACEHOLDER_HEIGHT = _env_int("EMBEDDING_PREVIEW_PLACEHOLDER_HEIGHT", 540, min_value=180, max_value=1080)
+EMBEDDING_PREVIEW_OVERLAY_TTL_S = _env_float("EMBEDDING_PREVIEW_OVERLAY_TTL_S", 1.5, min_value=0.1, max_value=10.0)
+EMBEDDING_ENABLE_CV2_VIEWER = _env_bool("EMBEDDING_ENABLE_CV2_VIEWER", False)
+EMBEDDING_EXTRACT_ON_STOP = _env_bool("EMBEDDING_EXTRACT_ON_STOP", False)
+EMBEDDING_STOP_JOIN_TIMEOUT_S = _env_float("EMBEDDING_STOP_JOIN_TIMEOUT_S", 1.0, min_value=0.0, max_value=15.0)
+EMBEDDING_STOP_DRAIN_IO_SECONDS = _env_float("EMBEDDING_STOP_DRAIN_IO_SECONDS", 0.3, min_value=0.0, max_value=30.0)
 
+
+
+def _remember_preview_overlay(
+    camera_id: int,
+    *,
+    frame_idx: int,
+    member_name: str,
+    det_boxes: Optional[List[tuple[int, int, int, int, float]]] = None,
+    faces: Optional[List[Dict[str, Any]]] = None,
+    faces_checked: bool = False,
+) -> Dict[str, Any]:
+    """Store latest person/face boxes for the fast preview path.
+
+    Capture frames are intentionally pushed to the UI before the slower
+    YOLO/face loop finishes.  This cache lets the capture thread draw the most
+    recent boxes onto those raw frames instead of constantly replacing the UI
+    with unannotated images.  Face detection usually runs every N frames, so we
+    keep the last face boxes during skipped face frames to avoid flicker.
+    """
+    cid = int(camera_id)
+    now = time.time()
+    incoming_faces = list(faces or [])
+    incoming_faces_checked = bool(faces_checked)
+
+    with frames_lock:
+        previous = latest_preview_overlays.get(cid)
+        if not incoming_faces_checked and previous:
+            try:
+                prev_age = now - float(previous.get("face_ts", previous.get("ts", 0.0)))
+            except Exception:
+                prev_age = float("inf")
+            if prev_age <= float(EMBEDDING_PREVIEW_OVERLAY_TTL_S):
+                prev_faces = list(previous.get("faces") or [])
+                if prev_faces:
+                    incoming_faces = prev_faces
+                    incoming_faces_checked = True
+
+        payload = {
+            "ts": now,
+            "frame_idx": int(frame_idx),
+            "member_name": str(member_name or "member"),
+            "det_boxes": list(det_boxes or []),
+            "faces": incoming_faces,
+            "faces_checked": incoming_faces_checked,
+            "face_ts": now if bool(faces_checked) else float((previous or {}).get("face_ts", now)),
+        }
+        latest_preview_overlays[cid] = payload
+        return dict(payload)
+
+
+def _get_preview_overlay(camera_id: int) -> Optional[Dict[str, Any]]:
+    """Return recent person/face overlay data, dropping stale boxes."""
+    cid = int(camera_id)
+    now = time.time()
+    with frames_lock:
+        payload = latest_preview_overlays.get(cid)
+        if not payload:
+            return None
+        try:
+            age = now - float(payload.get("ts", 0.0))
+        except Exception:
+            age = float("inf")
+        if age > float(EMBEDDING_PREVIEW_OVERLAY_TTL_S):
+            return None
+        return dict(payload)
+
+
+def _clip_preview_box(
+    box: Tuple[int, int, int, int],
+    width: int,
+    height: int,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Clip a preview box to image bounds."""
+    x1, y1, x2, y2 = map(int, box)
+    x1 = max(0, min(int(width) - 1, x1))
+    y1 = max(0, min(int(height) - 1, y1))
+    x2 = max(0, min(int(width) - 1, x2))
+    y2 = max(0, min(int(height) - 1, y2))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
 
 
 def _draw_embedding_preview_frame(
@@ -306,7 +469,10 @@ def _draw_embedding_preview_frame(
 
     # Person boxes
     for idx, (x1, y1, x2, y2, conf) in enumerate(det_boxes):
-        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+        clipped = _clip_preview_box((int(x1), int(y1), int(x2), int(y2)), w, h)
+        if not clipped:
+            continue
+        x1, y1, x2, y2 = clipped
         cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 255), 2)
         label = f"person {idx + 1} {float(conf):.2f}"
         cv2.putText(out, label, (x1, max(header_h + 18, y1 - 7)), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 255), 2, cv2.LINE_AA)
@@ -315,12 +481,14 @@ def _draw_embedding_preview_frame(
     if faces_checked:
         for fm in faces:
             try:
-                fx1, fy1, fx2, fy2 = map(int, fm.get("bbox") or (0, 0, 0, 0))
+                raw_box = tuple(map(int, fm.get("bbox") or (0, 0, 0, 0)))
                 score = float(fm.get("score", 0.0))
             except Exception:
                 continue
-            if fx2 <= fx1 or fy2 <= fy1:
+            clipped = _clip_preview_box(raw_box, w, h)
+            if not clipped:
                 continue
+            fx1, fy1, fx2, fy2 = clipped
             cv2.rectangle(out, (fx1, fy1), (fx2, fy2), (0, 255, 0), 2)
             cv2.putText(out, f"face {score:.2f}", (fx1, max(header_h + 18, fy1 - 7)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
 
@@ -329,22 +497,101 @@ def _draw_embedding_preview_frame(
     return out
 
 
-def get_preview_jpeg(camera_id: Optional[int] = None, jpeg_quality: Optional[int] = None) -> Optional[bytes]:
-    """Return latest embedding preview frame as JPEG bytes."""
-    with frames_lock:
-        if camera_id is not None:
-            frame = latest_frames.get(int(camera_id))
-        else:
-            keys = sorted(latest_frames.keys())
-            frame = latest_frames.get(keys[0]) if keys else None
+def _resize_for_preview(frame: np.ndarray) -> np.ndarray:
+    """Downscale large preview frames before JPEG encoding."""
     if frame is None or getattr(frame, "size", 0) == 0:
-        return None
+        return np.zeros((EMBEDDING_PREVIEW_PLACEHOLDER_HEIGHT, EMBEDDING_PREVIEW_PLACEHOLDER_WIDTH, 3), dtype=np.uint8)
+    h, w = frame.shape[:2]
+    max_w = int(EMBEDDING_PREVIEW_MAX_WIDTH)
+    if w <= max_w:
+        return frame
+    scale = max_w / float(max(1, w))
+    return cv2.resize(frame, (max_w, max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+
+
+def _encode_preview_jpeg(frame: np.ndarray, jpeg_quality: Optional[int] = None) -> Optional[bytes]:
     q = int(jpeg_quality if jpeg_quality is not None else EMBEDDING_PREVIEW_JPEG_QUALITY)
     q = max(30, min(95, q))
-    ok, enc = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), q])
-    if not ok:
+    try:
+        ok, enc = cv2.imencode(".jpg", _resize_for_preview(frame), [int(cv2.IMWRITE_JPEG_QUALITY), q])
+        return enc.tobytes() if ok else None
+    except Exception:
         return None
-    return enc.tobytes()
+
+
+def _preview_placeholder(camera_id: Optional[int] = None, message: str = "Waiting for embedding preview...") -> bytes:
+    h = int(EMBEDDING_PREVIEW_PLACEHOLDER_HEIGHT)
+    w = int(EMBEDDING_PREVIEW_PLACEHOLDER_WIDTH)
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    cv2.rectangle(img, (0, 0), (w, 64), (18, 18, 18), -1)
+    title = "Embedding preview"
+    if camera_id is not None:
+        title += f" | cam {int(camera_id)}"
+    cv2.putText(img, title[:120], (18, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 229, 255), 2, cv2.LINE_AA)
+    cv2.putText(img, message[:130], (18, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (230, 237, 243), 1, cv2.LINE_AA)
+    cv2.putText(img, "Start capture or wait for the first decoded RTSP frame.", (18, h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (180, 180, 180), 2, cv2.LINE_AA)
+    return _encode_preview_jpeg(img) or b""
+
+
+def _store_preview_frame(
+    camera_id: int,
+    frame: np.ndarray,
+    *,
+    max_fps: Optional[float] = None,
+    jpeg_quality: Optional[int] = None,
+    keep_cv_frame: bool = True,
+    force: bool = False,
+) -> None:
+    """Cache a pre-encoded JPEG so preview.jpg is a cheap memory lookup.
+
+    Encoding happens outside frames_lock.  This keeps the UI polling path fast
+    and prevents JPEG compression from blocking capture/detection threads.
+    """
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return
+    cid = int(camera_id)
+    fps = float(max_fps if max_fps is not None else EMBEDDING_PREVIEW_FPS)
+    min_interval = 1.0 / max(1.0, min(30.0, fps))
+    now = time.time()
+    with frames_lock:
+        last = float(latest_preview_ts.get(cid, 0.0))
+    if not force and last > 0.0 and (now - last) < min_interval:
+        return
+
+    frame_small = _resize_for_preview(frame)
+    jpg = _encode_preview_jpeg(frame_small, jpeg_quality=jpeg_quality)
+    if not jpg:
+        return
+    with frames_lock:
+        latest_preview_jpegs[cid] = jpg
+        latest_preview_ts[cid] = now
+        if keep_cv_frame:
+            latest_frames[cid] = frame_small
+
+
+def get_preview_jpeg(camera_id: Optional[int] = None, jpeg_quality: Optional[int] = None) -> Optional[bytes]:
+    """Return latest embedding preview frame as JPEG bytes.
+
+    This deliberately returns a placeholder instead of 404 while capture is
+    warming up.  The frontend can open the preview immediately and keep polling
+    without showing broken images.
+    """
+    cid = int(camera_id) if camera_id is not None else None
+    with frames_lock:
+        if cid is not None:
+            jpg = latest_preview_jpegs.get(cid)
+            if jpg:
+                return jpg
+        else:
+            keys = sorted(latest_preview_jpegs.keys())
+            if keys:
+                jpg = latest_preview_jpegs.get(keys[0])
+                if jpg:
+                    return jpg
+
+    if cid is not None and current_camera_ids and cid not in set(map(int, current_camera_ids)):
+        return _preview_placeholder(cid, "No active embedding preview for this camera.")
+    return _preview_placeholder(cid, "No frame available yet.")
 
 
 def embedding_preview_mjpeg_generator(camera_id: Optional[int] = None, max_fps: Optional[float] = None, jpeg_quality: Optional[int] = None):
@@ -353,7 +600,7 @@ def embedding_preview_mjpeg_generator(camera_id: Optional[int] = None, max_fps: 
     boundary = b"--frame\r\n"
     while True:
         jpg = get_preview_jpeg(camera_id=camera_id, jpeg_quality=jpeg_quality)
-        if jpg is not None:
+        if jpg:
             yield boundary + b"Content-Type: image/jpeg\r\nCache-Control: no-store\r\n\r\n" + jpg + b"\r\n"
         time.sleep(delay)
 
@@ -1216,60 +1463,92 @@ def _get_member_display_name(member: Any, fallback: str = "unknown") -> str:
     return fallback
 
 
+def _encode_url_component(value: str) -> str:
+    """Accept either raw or already URL-encoded credentials."""
+    return quote(unquote(str(value or "")), safe="")
+
+
+def _parse_channel_map() -> Dict[int, str]:
+    result: Dict[int, str] = {}
+    raw = os.getenv("CHANNEL_MAP", "")
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or ":" not in pair:
+            continue
+        cam_id, channel = pair.split(":", 1)
+        try:
+            result[int(cam_id.strip())] = channel.strip()
+        except ValueError:
+            continue
+    return result
+
+
+def _resolve_rtsp_channel(camera_id: int | None = None) -> str:
+    if RTSP_CHANNEL_SOURCE in {"camera_id", "id", "camera"} and camera_id is not None:
+        return str(camera_id)
+    if RTSP_CHANNEL_SOURCE in {"channel_map", "map", "mapped"} and camera_id is not None:
+        mapped = _parse_channel_map().get(int(camera_id))
+        if mapped:
+            return str(mapped)
+    return RTSP_CHANNEL
+
+
+def _hikvision_suffix_from_subtype(subtype: str) -> str:
+    subtype_s = str(subtype or "0").strip().lower()
+    if subtype_s in {"main", "mainstream", "primary"}:
+        return "01"
+    if subtype_s in {"sub", "substream", "secondary"}:
+        return "02"
+    try:
+        # Existing config uses 0 for main stream and 1 for sub stream.
+        return f"{int(subtype_s) + 1:02d}"
+    except Exception:
+        return "01"
+
+
+def _build_channel_stream(channel: str, subtype: str, explicit_stream: str = "") -> str:
+    stream = str(explicit_stream or "").strip()
+    if stream:
+        return stream
+
+    channel_s = str(channel or "1").strip() or "1"
+    # Allow CHANNEL_MAP/RTSP_CHANNEL to contain a complete Hikvision stream id like 101 or 1201.
+    if channel_s.isdigit() and int(channel_s) >= 100:
+        return channel_s
+
+    return f"{channel_s}{_hikvision_suffix_from_subtype(subtype)}"
+
+
 def _build_rtsp_url(ip: str, camera_id: int, camera_name: str = "") -> str:
-    """
-    Build an RTSP URL from Camera.ip_address.
+    """Build live RTSP from the DB camera template for camera_id.
 
-    Expected DB value:
-        Camera.ip_address = "192.168.1.161"
-
-    Output with the default RTSP_URL_TEMPLATE:
-        rtsp://admin:admin%40123@10.10.43.251:554/cam/realmonitor?channel=1&subtype=0
-
-    If Camera.ip_address already contains a full rtsp:// URL, it is returned unchanged.
+    Live streams are generated from the camera row only. NVR rows are used only
+    by playback. If cameras.ip_address already stores a full rtsp:// URL, it is
+    returned as-is for compatibility.
     """
     ip = (ip or "").strip()
-    if not ip:
-        return ""
-
-    # Allow storing full RTSP URL in ip_address field.
     if ip.lower().startswith(("rtsp://", "rtsps://")):
         return ip
 
-    if RTSP_URL_TEMPLATE:
-        try:
-            return RTSP_URL_TEMPLATE.format(
-                ip=ip,
-                camera_id=int(camera_id),
-                id=int(camera_id),
-                name=str(camera_name or ""),
-                user=RTSP_USERNAME,
-                username=RTSP_USERNAME,
-                password=RTSP_PASSWORD,
-                port=RTSP_PORT,
-                stream=RTSP_STREAM,
-                channel=RTSP_CHANNEL,
-                subtype=RTSP_SUBTYPE,
+    if Camera is None:
+        return ""
+
+    try:
+        with db_session() as db:
+            cam = (
+                db.query(Camera)
+                .filter(Camera.id == int(camera_id))
+                .first()
             )
-        except Exception:
-            logger.exception("RTSP_URL_TEMPLATE formatting failed; falling back to basic builder")
-
-    auth = ""
-    if RTSP_USERNAME:
-        auth = RTSP_USERNAME
-        if RTSP_PASSWORD:
-            auth += f":{RTSP_PASSWORD}"
-        auth += "@"
-
-    port = f":{RTSP_PORT}" if RTSP_PORT else ""
-    path = RTSP_PATH or "/cam/realmonitor"
-    if path and not path.startswith("/"):
-        path = "/" + path
-
-    if "?" in path:
-        return f"{RTSP_SCHEME}://{auth}{ip}{port}{path}"
-
-    return f"{RTSP_SCHEME}://{auth}{ip}{port}{path}?channel={RTSP_CHANNEL}&subtype={RTSP_SUBTYPE}"
+            if not cam:
+                return ""
+            return build_camera_live_rtsp_url(cam)
+    except RTSPTemplateError as exc:
+        logger.error("Camera %s RTSP template error: %s", camera_id, exc)
+        return ""
+    except Exception as exc:
+        logger.exception("Failed to build DB RTSP URL for camera %s: %s", camera_id, exc)
+        return ""
 
 
 def _db_get_camera_ids(
@@ -1320,7 +1599,14 @@ def _camera_streams_from_db(camera_ids: Optional[List[int]] = None) -> Dict[int,
             cid = int(getattr(cam, "id"))
         except Exception:
             continue
-        url = _build_rtsp_url(str(getattr(cam, "ip_address", "") or ""), cid, str(getattr(cam, "name", "") or ""))
+        try:
+            url = build_camera_live_rtsp_url(cam)
+        except RTSPTemplateError as exc:
+            logger.error("Skipping camera %s: %s", cid, exc)
+            continue
+        except Exception as exc:
+            logger.exception("Skipping camera %s because DB RTSP URL build failed: %s", cid, exc)
+            continue
         if url:
             out[cid] = url
 
@@ -1376,6 +1662,32 @@ def capture_thread_fn(camera_id: int, rtsp_url: str):
             if not ok or frame is None:
                 time.sleep(0.01)
                 continue
+
+            # Make the browser preview open immediately, even while YOLO/face
+            # processing is busy.  Draw the latest cached boxes over the raw frame
+            # so the fast preview does not flicker back to an unannotated image.
+            overlay = _get_preview_overlay(camera_id)
+            if overlay:
+                preview_frame = _draw_embedding_preview_frame(
+                    frame,
+                    camera_id=int(camera_id),
+                    member_name=str(overlay.get("member_name") or "member"),
+                    frame_idx=int(overlay.get("frame_idx") or 0),
+                    det_boxes=overlay.get("det_boxes") or [],
+                    faces=overlay.get("faces") or [],
+                    faces_checked=bool(overlay.get("faces_checked", False)),
+                    message="live preview",
+                )
+            else:
+                preview_frame = frame
+
+            _store_preview_frame(
+                camera_id,
+                preview_frame,
+                max_fps=EMBEDDING_PREVIEW_RAW_FPS,
+                jpeg_quality=EMBEDDING_PREVIEW_JPEG_QUALITY,
+                keep_cv_frame=bool(EMBEDDING_ENABLE_CV2_VIEWER),
+            )
 
             while not q.empty():
                 try:
@@ -1588,17 +1900,30 @@ def embedding_loop_for_cam(camera_id: int, rtsp_url: str):
                         except Exception:
                             pass
 
+            overlay = _remember_preview_overlay(
+                int(camera_id),
+                frame_idx=int(frame_idx),
+                member_name=member_name,
+                det_boxes=det_boxes_i,
+                faces=faces,
+                faces_checked=bool(faces_checked),
+            )
             preview = _draw_embedding_preview_frame(
                 frame,
                 camera_id=int(camera_id),
                 member_name=member_name,
                 frame_idx=int(frame_idx),
                 det_boxes=det_boxes_i,
-                faces=faces,
-                faces_checked=bool(faces_checked),
+                faces=overlay.get("faces") or faces,
+                faces_checked=bool(overlay.get("faces_checked", faces_checked)),
             )
-            with frames_lock:
-                latest_frames[camera_id] = preview
+            _store_preview_frame(
+                int(camera_id),
+                preview,
+                max_fps=EMBEDDING_PREVIEW_ANNOTATED_FPS,
+                jpeg_quality=EMBEDDING_PREVIEW_JPEG_QUALITY,
+                keep_cv_frame=True,
+            )
 
     finally:
         logger.info("[Loop cam=%d] stopped", camera_id)
@@ -1658,6 +1983,128 @@ def _count_images(member_id: int, camera_id: int, member_name: str) -> Tuple[int
     return body, face, back_body
 
 
+def _gallery_manifest(paths: List[Path]) -> List[Dict[str, object]]:
+    manifest: List[Dict[str, object]] = []
+    for p in paths:
+        try:
+            st = p.stat()
+            manifest.append({
+                "path": str(p.resolve()),
+                "size": int(st.st_size),
+                "mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))),
+            })
+        except Exception:
+            manifest.append({"path": str(p), "size": -1, "mtime_ns": -1})
+    return manifest
+
+
+def _cache_signature(kind: str) -> str:
+    cfg = {
+        "version": 3,
+        "kind": str(kind),
+        "expected_dim": EXPECTED_EMBED_DIM,
+        "fast_mode": bool(EMBEDDING_FAST_MODE),
+        "reid_models": list(REID_MODELS),
+        "body_tta_flip": bool(BODY_TTA_FLIP),
+        "face_tta_flip": bool(FACE_TTA_FLIP),
+        "face_model": FACE_MODEL,
+        "face_det_size": tuple(FACE_DET_SIZE),
+        "face_max_side": int(FACE_MAX_SIDE),
+        "face_scan_top_ratio": float(FACE_SCAN_TOP_RATIO),
+        "back_body_use_reid": bool(BACK_BODY_USE_REID),
+        "back_reid_weight": float(BACK_REID_WEIGHT),
+        "back_shape_weight": float(BACK_SHAPE_WEIGHT),
+        "back_head_cut_ratio": float(BACK_HEAD_CUT_RATIO),
+        "back_shape_seed": int(BACK_SHAPE_SEED),
+        "blur_filter": bool(EMBEDDING_BLUR_FILTER),
+    }
+    data = json.dumps(cfg, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha1(data).hexdigest()[:16]
+
+
+def _embedding_cache_path(member_id: int, camera_id: int, member_name: str, kind: str) -> Path:
+    cache_dir = Path(CROPS_ROOT) / ".embedding_cache" / _member_folder(member_id, member_name) / f"cam_{int(camera_id)}"
+    _ensure_dir(cache_dir)
+    return cache_dir / f"{kind}_{_cache_signature(kind)}.npz"
+
+
+def _load_embedding_cache(
+    member_id: int,
+    camera_id: int,
+    member_name: str,
+    kind: str,
+    paths: List[Path],
+) -> Optional[Tuple[List[np.ndarray], np.ndarray]]:
+    if not EMBEDDING_CACHE_ENABLED or not paths:
+        return None
+    cache_path = _embedding_cache_path(member_id, camera_id, member_name, kind)
+    if not cache_path.exists():
+        return None
+    manifest = _gallery_manifest(paths)
+    try:
+        with np.load(str(cache_path), allow_pickle=False) as data:
+            cached_manifest = json.loads(str(data["manifest_json"].item()))
+            if cached_manifest != manifest:
+                return None
+            bank_arr = np.asarray(data["bank"], dtype=np.float32)
+            centroid = _as_512f(np.asarray(data["centroid"], dtype=np.float32))
+            if bank_arr.ndim != 2 or bank_arr.shape[1] != EXPECTED_EMBED_DIM or centroid is None:
+                return None
+            bank = []
+            for row in bank_arr:
+                vv = _as_512f(row)
+                if vv is not None:
+                    bank.append(vv)
+            if not bank:
+                return None
+            logger.info("Embedding cache hit: member=%s cam=%s kind=%s images=%s", member_id, camera_id, kind, len(paths))
+            return bank, centroid
+    except Exception:
+        logger.debug("Embedding cache ignored because it could not be read: %s", cache_path, exc_info=True)
+        return None
+
+
+def _save_embedding_cache(
+    member_id: int,
+    camera_id: int,
+    member_name: str,
+    kind: str,
+    paths: List[Path],
+    bank: Optional[List[np.ndarray]],
+    centroid: Optional[np.ndarray],
+) -> None:
+    if not EMBEDDING_CACHE_ENABLED or not paths or not bank or centroid is None:
+        return
+    cleaned = [_as_512f(v) for v in bank]
+    cleaned = [v for v in cleaned if v is not None]
+    cent = _as_512f(centroid)
+    if not cleaned or cent is None:
+        return
+    cache_path = _embedding_cache_path(member_id, camera_id, member_name, kind)
+    tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    try:
+        np.savez_compressed(
+            str(tmp),
+            manifest_json=np.array(json.dumps(_gallery_manifest(paths), separators=(",", ":"))),
+            bank=np.stack(cleaned, axis=0).astype(np.float32),
+            centroid=cent.astype(np.float32),
+        )
+        # np.savez_compressed appends .npz if the supplied name does not end in
+        # .npz.  Handle both cases so Windows/Linux behave the same.
+        actual_tmp = tmp if tmp.exists() else Path(str(tmp) + ".npz")
+        os.replace(str(actual_tmp), str(cache_path))
+    except Exception:
+        logger.debug("Embedding cache write failed: %s", cache_path, exc_info=True)
+        try:
+            if tmp.exists():
+                tmp.unlink()
+            appended = Path(str(tmp) + ".npz")
+            if appended.exists():
+                appended.unlink()
+        except Exception:
+            pass
+
+
 def _ahash8(img_bgr: np.ndarray) -> int:
     try:
         g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -1673,6 +2120,8 @@ def _ahash8(img_bgr: np.ndarray) -> int:
 
 
 def _is_blurry(img_bgr: np.ndarray, var_thr: float = 30.0) -> bool:
+    if not EMBEDDING_BLUR_FILTER:
+        return False
     try:
         g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
         return float(cv2.Laplacian(g, cv2.CV_64F).var()) < var_thr
@@ -1706,11 +2155,19 @@ def _compute_body_bank_and_centroid_from_gallery(
         return None, None
 
     gpu = torch.cuda.is_available() and ("cuda" in str(DEVICE).lower())
-    B = 64 if gpu else 32
+    B = int(REID_BATCH_SIZE_GPU if gpu else REID_BATCH_SIZE_CPU)
+    per_image_units = len(reid_extractors) * (2 if BODY_TTA_FLIP else 1)
+
+    cached = _load_embedding_cache(member_id, camera_id, member_name, "body", imgs)
+    if cached is not None:
+        if on_file_done:
+            on_file_done(len(imgs))
+        if on_work_done:
+            on_work_done(len(imgs) * per_image_units)
+        return cached
 
     prepared: List[Tuple[np.ndarray, Optional[np.ndarray]]] = []
     seen_hashes: set[int] = set()
-    per_image_units = len(reid_extractors) * (2 if BODY_TTA_FLIP else 1)
 
     for p in imgs:
         img = _load_bgr(p)
@@ -1800,6 +2257,7 @@ def _compute_body_bank_and_centroid_from_gallery(
             on_file_done(1)
 
     centroid = _mean_embed(vectors_per_image)
+    _save_embedding_cache(member_id, camera_id, member_name, "body", imgs, vectors_per_image, centroid)
     return (vectors_per_image if vectors_per_image else None), centroid
 
 
@@ -1822,9 +2280,17 @@ def _compute_face_bank_and_centroid_from_gallery(
 
     vectors: List[np.ndarray] = []
     seen_hashes: set[int] = set()
-    MAX_SIDE = 640
+    MAX_SIDE = int(FACE_MAX_SIDE)
     MIN_BODY_SIDE = 40
     per_image_units = (2 if FACE_TTA_FLIP else 1)
+
+    cached = _load_embedding_cache(member_id, camera_id, member_name, "face", imgs)
+    if cached is not None:
+        if on_file_done:
+            on_file_done(len(imgs))
+        if on_work_done:
+            on_work_done(len(imgs) * per_image_units)
+        return cached
 
     for p in imgs:
         img = _load_bgr(p)
@@ -1852,11 +2318,20 @@ def _compute_face_bank_and_centroid_from_gallery(
             continue
         seen_hashes.add(hval)
 
-        if max(h, w) > MAX_SIDE:
-            scale = MAX_SIDE / float(max(h, w))
-            img_proc = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_LINEAR)
+        # Face gallery currently stores the person crop, not the isolated face.
+        # Scanning only the upper body area is much faster for tall person crops
+        # and still covers the face in normal enrollment images.
+        img_scan = img
+        if h > int(w * 1.15) and FACE_SCAN_TOP_RATIO < 0.999:
+            cut_h = max(MIN_BODY_SIDE, int(h * float(FACE_SCAN_TOP_RATIO)))
+            img_scan = img[: min(h, cut_h), :]
+
+        sh, sw = img_scan.shape[:2]
+        if max(sh, sw) > MAX_SIDE:
+            scale = MAX_SIDE / float(max(sh, sw))
+            img_proc = cv2.resize(img_scan, (max(1, int(sw * scale)), max(1, int(sh * scale))), interpolation=cv2.INTER_LINEAR)
         else:
-            img_proc = img
+            img_proc = img_scan
 
         def _best_face(bgr_img) -> Optional[np.ndarray]:
             try:
@@ -1911,6 +2386,7 @@ def _compute_face_bank_and_centroid_from_gallery(
         return None, None
 
     centroid = _mean_embed(vectors)
+    _save_embedding_cache(member_id, camera_id, member_name, "face", imgs, vectors, centroid)
     return (vectors if vectors else None), centroid
 
 
@@ -1928,7 +2404,7 @@ def _compute_back_body_bank_and_centroid_from_gallery(
         return None, None
 
     gpu = torch.cuda.is_available() and ("cuda" in str(DEVICE).lower())
-    B = 64 if gpu else 32
+    B = int(REID_BATCH_SIZE_GPU if gpu else REID_BATCH_SIZE_CPU)
 
     seen_hashes: set[int] = set()
 
@@ -1937,8 +2413,16 @@ def _compute_back_body_bank_and_centroid_from_gallery(
     keep_mask: List[bool] = []
     reid_ready: List[bool] = []
 
-    reid_units = (len(reid_extractors) * (2 if BODY_TTA_FLIP else 1)) if reid_extractors else 0
+    reid_units = (len(reid_extractors) * (2 if BODY_TTA_FLIP else 1)) if (reid_extractors and BACK_BODY_USE_REID) else 0
     per_image_units = 1 + int(reid_units)
+
+    cached = _load_embedding_cache(member_id, camera_id, member_name, "back_body", imgs)
+    if cached is not None:
+        if on_file_done:
+            on_file_done(len(imgs))
+        if on_work_done:
+            on_work_done(len(imgs) * per_image_units)
+        return cached
 
     for p in imgs:
         img = _load_bgr(p)
@@ -1986,7 +2470,7 @@ def _compute_back_body_bank_and_centroid_from_gallery(
         rgb = None
         rgb_flip = None
         can_reid = False
-        if reid_extractors:
+        if reid_extractors and BACK_BODY_USE_REID:
             try:
                 rgb = _prep_reid(img)
                 rgb_flip = cv2.flip(rgb, 1) if BODY_TTA_FLIP else None
@@ -2013,7 +2497,7 @@ def _compute_back_body_bank_and_centroid_from_gallery(
 
     reid_vectors_per_image: List[Optional[np.ndarray]] = [None for _ in prepared_reid]
 
-    if reid_extractors:
+    if reid_extractors and BACK_BODY_USE_REID:
         per_model_embs: List[List[np.ndarray]] = [[] for _ in reid_extractors]
 
         for midx, ext in enumerate(reid_extractors):
@@ -2090,6 +2574,7 @@ def _compute_back_body_bank_and_centroid_from_gallery(
         return None, None
 
     centroid = _mean_embed(fused_vectors)
+    _save_embedding_cache(member_id, camera_id, member_name, "back_body", imgs, fused_vectors, centroid)
     return (fused_vectors if fused_vectors else None), centroid
 
 
@@ -2276,7 +2761,7 @@ def _extract_worker(member_id: int, member_name: str, camera_id: int):
         back_bank = None
         back_cent = None
         if total_back > 0:
-            reid_units = (len(reid_extractors) * (2 if BODY_TTA_FLIP else 1)) if reid_extractors else 0
+            reid_units = (len(reid_extractors) * (2 if BODY_TTA_FLIP else 1)) if (reid_extractors and BACK_BODY_USE_REID) else 0
             units_per = 1 + reid_units
             _progress_set(
                 member_id,
@@ -2301,7 +2786,10 @@ def _extract_worker(member_id: int, member_name: str, camera_id: int):
         else:
             _progress_set(member_id, camera_id, message="Skipping back-body (no images)")
 
-        # Validation: ensure all six embedding inputs are present before DB update.
+        # By default, save whichever embedding types are available.  Requiring
+        # all body/face/back-body banks made small galleries fail after doing a
+        # lot of work.  Set EMBEDDING_REQUIRE_ALL_KINDS=True if your deployment
+        # must reject partial galleries.
         required_pairs = [
             ("Body embeddings", body_cent),
             ("Face embeddings", face_cent),
@@ -2311,7 +2799,8 @@ def _extract_worker(member_id: int, member_name: str, camera_id: int):
             ("Back body bank", back_bank),
         ]
         missing = [name for name, val in required_pairs if val is None]
-        if missing:
+        available_pairs = [name for name, val in required_pairs if val is not None]
+        if EMBEDDING_REQUIRE_ALL_KINDS and missing:
             missing_list = ", ".join(missing)
             friendly = (
                 f"Missing required embedding data: {missing_list}. "
@@ -2326,6 +2815,23 @@ def _extract_worker(member_id: int, member_name: str, camera_id: int):
                 percent=100,
             )
             return
+        if not available_pairs:
+            _progress_set(
+                member_id,
+                camera_id,
+                stage="error",
+                message="No valid embeddings were produced from the selected gallery images.",
+                percent=100,
+            )
+            return
+        if missing:
+            logger.info(
+                "Partial embedding update for member=%s cam=%s; saved=%s missing=%s",
+                member_id,
+                camera_id,
+                ", ".join(available_pairs),
+                ", ".join(missing),
+            )
 
         res = _update_db_embeddings(
             member_id,
@@ -2453,10 +2959,29 @@ def extract_embeddings_sync(member_id: int, camera_ids: Optional[Any] = None) ->
 
 # ===================== Control API =====================
 
-def start_extraction(member_id: int, camera_ids: Optional[Any] = None, show_viewer: bool = True) -> dict:
+def _clear_gallery_dirs(member_id: int, member_name: str, camera_ids: List[int]) -> None:
+    """Remove previous crops for this member/camera set when UI asks for it."""
+    for cid in [int(c) for c in camera_ids]:
+        for folder_fn in (_gallery_body_dir, _gallery_face_dir, _gallery_back_body_dir):
+            d = folder_fn(int(member_id), cid, member_name)
+            try:
+                if d.exists():
+                    shutil.rmtree(d)
+                _ensure_dir(d)
+            except Exception:
+                logger.exception("Failed to clear gallery folder: %s", d)
+        cache_d = Path(CROPS_ROOT) / ".embedding_cache" / _member_folder(member_id, member_name) / f"cam_{cid}"
+        try:
+            if cache_d.exists():
+                shutil.rmtree(cache_d)
+        except Exception:
+            logger.debug("Failed to clear embedding cache folder: %s", cache_d, exc_info=True)
+
+
+def start_extraction(member_id: int, camera_ids: Optional[Any] = None, show_viewer: bool = True, clear_existing: bool = False) -> dict:
     """
     camera_ids refer to cameras.id (DB FK).
-    RTSP URL is built from Camera.ip_address using RTSP_URL_TEMPLATE.
+    RTSP URL is built from cameras.rtsp_url_template using camera connection details only. NVR rows are used only for playback.
     """
     global is_running, current_member_id, current_member_name, current_camera_ids, current_camera_streams, viewer_thread
 
@@ -2480,7 +3005,7 @@ def start_extraction(member_id: int, camera_ids: Optional[Any] = None, show_view
             "message": "No valid cameras/RTSP streams configured",
             "requested_camera_ids": selected,
             "available_camera_ids": avail,
-            "hint": "Populate cameras table. Store only the camera IP in cameras.ip_address and set RTSP_URL_TEMPLATE.",
+            "hint": "Populate cameras.rtsp_url_template, cameras.ip_address, rtsp_port, rtsp_username, rtsp_password, and rtsp_channel.",
         }
 
     if selected is None:
@@ -2509,12 +3034,19 @@ def start_extraction(member_id: int, camera_ids: Optional[Any] = None, show_view
             logger.exception("DB error during member lookup (start_extraction).")
             return {"status": "error", "message": "DB error"}
 
+    if clear_existing:
+        _clear_gallery_dirs(int(member_id), member_name, selected_ids)
+        logger.info("Cleared existing embedding galleries for member_id=%s camera_ids=%s", member_id, selected_ids)
+
     if yolo_model is None or (USE_FACE and face_app is None) or (not reid_extractors):
         init_models()
 
     stop_event.clear()
     with frames_lock:
         latest_frames.clear()
+        latest_preview_jpegs.clear()
+        latest_preview_ts.clear()
+        latest_preview_overlays.clear()
     for d in (capture_threads, extract_threads, cap_queues):
         d.clear()
 
@@ -2631,18 +3163,25 @@ def stop_extraction(reason: str = "user") -> dict:
         for d in (capture_threads, extract_threads):
             for _cid, th in list(d.items()):
                 try:
-                    th.join(timeout=1.5)
+                    th.join(timeout=float(EMBEDDING_STOP_JOIN_TIMEOUT_S))
                 except Exception:
                     pass
 
-        try:
-            if io_queue is not None:
-                io_queue.join()
-        except Exception:
-            pass
+        if io_queue is not None and EMBEDDING_STOP_DRAIN_IO_SECONDS > 0:
+            deadline = time.time() + float(EMBEDDING_STOP_DRAIN_IO_SECONDS)
+            while time.time() < deadline:
+                try:
+                    if io_queue.empty():
+                        break
+                except Exception:
+                    break
+                time.sleep(0.03)
 
         with frames_lock:
             latest_frames.clear()
+            latest_preview_jpegs.clear()
+            latest_preview_ts.clear()
+            latest_preview_overlays.clear()
         capture_threads.clear()
         extract_threads.clear()
         cap_queues.clear()
@@ -2650,7 +3189,7 @@ def stop_extraction(reason: str = "user") -> dict:
         is_running = False
         logger.info("Extraction stopped (%s).", reason)
 
-        if mid_snapshot is not None and cams_snapshot:
+        if EMBEDDING_EXTRACT_ON_STOP and mid_snapshot is not None and cams_snapshot:
             if not reid_extractors or (USE_FACE and face_app is None):
                 init_models()
             threading.Thread(
@@ -2660,6 +3199,8 @@ def stop_extraction(reason: str = "user") -> dict:
                 daemon=True,
             ).start()
             logger.info("Auto-extract triggered for member_id=%s cameras=%s after stop.", mid_snapshot, cams_snapshot)
+        elif mid_snapshot is not None and cams_snapshot:
+            logger.info("Auto-extract on stop disabled; use /v1/embeddings/extract to build embeddings.")
 
         return {"status": "ok", "message": "Stopped capturing", "member_id": mid_snapshot, "camera_ids": cams_snapshot}
     finally:

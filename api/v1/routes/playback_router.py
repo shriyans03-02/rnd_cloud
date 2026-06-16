@@ -1,8 +1,8 @@
 """
-CP Plus NVR playback router with annotated tracing/WebRTC support.
+DB-driven NVR playback router with annotated tracing/WebRTC support.
 
 Flow used by the tracing UI:
-  UI camera_id -> CP Plus NVR channel=<camera_id> playback RTSP
+  UI camera_id -> cameras.nvr_channel + nvrs.playback_rtsp_template playback RTSP
   -> pipeline_tracing.py draws boxes/names
   -> FFmpeg publishes processed frames to MediaMTX playback_trace_* path
   -> MediaMTX exposes the processed path over WebRTC/HLS.
@@ -27,19 +27,25 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from app.core.config import settings
 from app.core.dependencies import get_current_user
 from app.db.models.user import User
+from app.db.session import SessionLocal
 from app.services.tracking.service import PlaybackTracingService
+from app.services.rtsp_url_builder import (
+    RTSPTemplateError,
+    build_playback_source_from_db,
+    get_camera_with_nvr,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 _STREAM_NAME_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,96}$")
-_CPPLUS_TIME_FORMAT = "%Y_%m_%d_%H_%M_%S"
+_NVR_TIME_FORMAT = "%Y_%m_%d_%H_%M_%S"
 
 
 def _nvr_time_format() -> str:
-    fmt = _settings_str("NVR_PLAYBACK_TIME_FORMAT", _CPPLUS_TIME_FORMAT).strip()
-    return fmt or _CPPLUS_TIME_FORMAT
+    fmt = _settings_str("NVR_PLAYBACK_TIME_FORMAT", _NVR_TIME_FORMAT).strip()
+    return fmt or _NVR_TIME_FORMAT
 
 
 def _validate_stream_name(name: str) -> str:
@@ -90,7 +96,7 @@ def _split_ffmpeg_flags(value: str) -> list[str]:
         return []
 
 
-# ── CP Plus timestamp helpers ─────────────────────────────────────────────────
+# ── NVR timestamp helpers ─────────────────────────────────────────────────
 
 def _nvr_tz() -> Optional[ZoneInfo]:
     tz_name = _settings_str("NVR_PLAYBACK_TIMEZONE", "Asia/Kolkata").strip()
@@ -133,8 +139,8 @@ def _parse_iso_dt(value: str) -> datetime:
     if not raw:
         raise ValueError("timestamp is required")
 
-    # Accept CP Plus formatted values too, useful for direct testing/curl.
-    for fmt in (_nvr_time_format(), _CPPLUS_TIME_FORMAT, "%Y%m%dT%H%M%SZ"):
+    # Accept NVR formatted values too, useful for direct testing/curl.
+    for fmt in (_nvr_time_format(), _NVR_TIME_FORMAT, "%Y%m%dT%H%M%SZ"):
         try:
             return datetime.strptime(raw, fmt)
         except ValueError:
@@ -152,7 +158,7 @@ def _dt_for_compare(dt: datetime) -> datetime:
     return dt.replace(tzinfo=timezone.utc)
 
 
-def _format_cpplus_time(dt: datetime) -> str:
+def _format_nvr_time(dt: datetime) -> str:
     tz = _nvr_tz()
     if dt.tzinfo is not None and tz is not None:
         dt = dt.astimezone(tz)
@@ -160,8 +166,8 @@ def _format_cpplus_time(dt: datetime) -> str:
 
 
 def to_nvr_time(value: str) -> str:
-    """Return CP Plus playback time: YYYY_MM_DD_HH_MM_SS."""
-    return _format_cpplus_time(_parse_iso_dt(value))
+    """Return NVR playback time: YYYY_MM_DD_HH_MM_SS."""
+    return _format_nvr_time(_parse_iso_dt(value))
 
 
 def _parse_and_validate_timestamps(
@@ -230,7 +236,7 @@ def kill_stream(stream_name: str) -> bool:
     return True
 
 
-# ── CP Plus channel / RTSP helpers ────────────────────────────────────────────
+# ── NVR channel / RTSP helpers ────────────────────────────────────────────
 
 def _quote_userinfo(value: str) -> str:
     # safe="%" lets existing encoded .env values such as Admin%40123 pass through
@@ -243,6 +249,15 @@ def _channel_for_camera(camera_id: int) -> int:
     if cam_id <= 0:
         raise RuntimeError("camera_id must be a positive integer.")
 
+    try:
+        with SessionLocal() as db:
+            cam = get_camera_with_nvr(db, cam_id)
+            if cam is not None:
+                return int(getattr(cam, "nvr_channel", None) or cam_id)
+    except Exception as exc:
+        logger.warning("Could not resolve DB NVR channel for camera_id=%s: %s", cam_id, exc)
+
+    # Legacy fallback for deployments that still have CHANNEL_MAP filled.
     mode = _settings_str("NVR_PLAYBACK_CHANNEL_SOURCE", "camera_id").strip().lower()
     if mode in {"camera_id", "camera", "direct", "id", ""}:
         return cam_id
@@ -251,45 +266,29 @@ def _channel_for_camera(camera_id: int) -> int:
     channel = channel_map.get(cam_id)
     if channel is None:
         raise RuntimeError(
-            f"No NVR channel mapped for camera_id={cam_id}. "
-            f"Either set NVR_PLAYBACK_CHANNEL_SOURCE=camera_id for CP Plus direct channels "
+            f"No NVR channel mapped for camera_id={cam_id}. Set cameras.nvr_channel in the DB "
             f"or add camera_id:channel to CHANNEL_MAP. Valid mapped IDs: {sorted(channel_map)}"
         )
     return int(channel)
 
 
-def _build_rtsp_source(camera_id: int, start_time: str, end_time: str) -> str:
-    channel = _channel_for_camera(int(camera_id))
-    path = _settings_str("NVR_PLAYBACK_PATH", "/cam/playback").strip() or "/cam/playback"
-    if not path.startswith("/"):
-        path = "/" + path
-
-    values = {
-        "username": _quote_userinfo(_settings_str("NVR_USER", "admin")),
-        "password": _quote_userinfo(_settings_str("NVR_PASS", "")),
-        "ip": _settings_str("NVR_IP", "").strip(),
-        "port": _settings_str("NVR_PORT", "554").strip() or "554",
-        "path": path,
-        "channel": int(channel),
-        "camera_id": int(camera_id),
-        "starttime": str(start_time),
-        "endtime": str(end_time),
-    }
-
-    if not values["ip"]:
-        raise RuntimeError("NVR_IP is required for CP Plus playback.")
-
-    template = _settings_str(
-        "NVR_PLAYBACK_URL_TEMPLATE",
-        "rtsp://{username}:{password}@{ip}:{port}/cam/playback?channel={channel}&starttime={starttime}&endtime={endtime}",
-    ).strip()
-    if not template:
-        template = "rtsp://{username}:{password}@{ip}:{port}{path}?channel={channel}&starttime={starttime}&endtime={endtime}"
-
+def _build_playback_source_info(camera_id: int, start_time, end_time):
     try:
-        return template.format(**values)
+        with SessionLocal() as db:
+            return build_playback_source_from_db(
+                db,
+                camera_id=int(camera_id),
+                start_time=start_time,
+                end_time=end_time,
+            )
+    except RTSPTemplateError as exc:
+        raise RuntimeError(str(exc)) from exc
     except Exception as exc:
-        raise RuntimeError(f"Invalid NVR_PLAYBACK_URL_TEMPLATE: {exc}") from exc
+        raise RuntimeError(f"Could not build NVR playback RTSP URL from DB: {exc}") from exc
+
+
+def _build_rtsp_source(camera_id: int, start_time, end_time) -> str:
+    return _build_playback_source_info(camera_id, start_time, end_time).url
 
 
 # ── Raw FFmpeg launcher ───────────────────────────────────────────────────────
@@ -299,9 +298,11 @@ def start_ffmpeg_stream(
     start_time: str,
     end_time: str,
     stream_name: str,
+    rtsp_source: Optional[str] = None,
 ) -> None:
     stream_name = _validate_stream_name(stream_name)
-    rtsp_source = _build_rtsp_source(int(camera_id), str(start_time), str(end_time))
+    if rtsp_source is None:
+        rtsp_source = _build_rtsp_source(int(camera_id), start_time, end_time)
     rtsp_output = f"{settings.MEDIAMTX_RTSP.rstrip('/')}/{stream_name}"
 
     ffmpeg_bin = str(getattr(settings, "FFMPEG_BIN", None) or "ffmpeg")
@@ -385,7 +386,7 @@ def start_ffmpeg_stream(
         proc._log_fh = log_fh  # type: ignore[attr-defined]
         with _stream_lock:
             _active_streams[stream_name] = proc
-        logger.info("Started CP Plus playback ffmpeg stream %s (pid=%d)", stream_name, proc.pid)
+        logger.info("Started NVR playback ffmpeg stream %s (pid=%d)", stream_name, proc.pid)
     except FileNotFoundError as exc:
         raise RuntimeError("ffmpeg not found. Install ffmpeg and ensure it is in PATH.") from exc
 
@@ -495,7 +496,7 @@ def _response_payload(
         "end_time": end_time,
         "camera_id": int(camera_id),
         "channel": int(channel),
-        "nvr_vendor": "cpplus",
+        "nvr_vendor": "db",
     }
     if request_mode:
         data["request_mode"] = request_mode
@@ -507,9 +508,14 @@ def _response_payload(
 @router.get("/stream/playback")
 async def start_playback(
     request: Request,
-    camera_id: int = Query(..., description="DB camera ID; CP Plus channel uses this same value by default"),
-    entry_ts: str = Query(..., description="Entry timestamp"),
-    exit_ts: Optional[str] = Query(None, description="Exit timestamp; omit for a 2-hour window"),
+    camera_id: Optional[int] = Query(None, description="DB camera ID"),
+    cameraId: Optional[int] = Query(None, description="CamelCase alias for camera_id"),
+    entry_ts: Optional[str] = Query(None, description="Entry/start timestamp"),
+    exit_ts: Optional[str] = Query(None, description="Exit/end timestamp; omit for a 2-hour window"),
+    start_time_query: Optional[str] = Query(None, alias="start_time", description="Alias for entry_ts"),
+    end_time_query: Optional[str] = Query(None, alias="end_time", description="Alias for exit_ts"),
+    startTime: Optional[str] = Query(None, description="CamelCase alias for entry_ts"),
+    endTime: Optional[str] = Query(None, description="CamelCase alias for exit_ts"),
     annotate: bool = Query(False, description="Run pipeline_tracing.py and publish processed frames"),
     request_mode: Optional[str] = Query(None, description="Playback mode: member or location"),
     mode: Optional[str] = Query(None, description="Legacy alias for request_mode"),
@@ -517,26 +523,31 @@ async def start_playback(
     member_name: Optional[str] = Query(None, description="Target member name for member mode"),
     current_user: User = Depends(get_current_user),
 ):
+    resolved_camera_id = camera_id if camera_id is not None else cameraId
+    if resolved_camera_id is None:
+        raise HTTPException(status_code=422, detail="camera_id is required.")
+    camera_id = int(resolved_camera_id)
+
+    entry_ts = entry_ts or start_time_query or startTime
+    exit_ts = exit_ts or end_time_query or endTime
+    if not entry_ts:
+        raise HTTPException(status_code=422, detail="entry_ts or start_time is required.")
+
+    entry_dt, exit_dt = _parse_and_validate_timestamps(entry_ts, exit_ts)
+    end_dt = exit_dt if exit_dt is not None else entry_dt + timedelta(hours=2)
+    stream_type = "playback" if exit_dt is not None else "live"
+
     try:
-        channel = _channel_for_camera(int(camera_id))
+        source_info = _build_playback_source_info(int(camera_id), entry_dt, end_dt)
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    entry_dt, exit_dt = _parse_and_validate_timestamps(entry_ts, exit_ts)
-    start_time = _format_cpplus_time(entry_dt)
-
-    if exit_dt is not None:
-        end_time = _format_cpplus_time(exit_dt)
-        stream_type = "playback"
-    else:
-        end_time = _format_cpplus_time(entry_dt + timedelta(hours=2))
-        stream_type = "live"
+    channel = source_info.channel
+    start_time = source_info.start_time
+    end_time = source_info.end_time
+    rtsp_source = source_info.url
 
     if _should_annotate(annotate, request_mode, mode, member_id, member_name):
-        try:
-            rtsp_source = _build_rtsp_source(int(camera_id), start_time, end_time)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         resolved_mode = _normalize_request_mode(request_mode, mode, member_id, member_name)
         svc = _get_playback_service(request)
@@ -557,7 +568,7 @@ async def start_playback(
             )
         except Exception as exc:
             logger.exception(
-                "Annotated CP Plus playback failed camera_id=%s channel=%s start=%s end=%s mode=%s member_id=%s",
+                "Annotated NVR playback failed camera_id=%s channel=%s start=%s end=%s mode=%s member_id=%s",
                 camera_id,
                 channel,
                 start_time,
@@ -567,7 +578,7 @@ async def start_playback(
             )
             raise HTTPException(
                 status_code=500,
-                detail=f"Could not start the annotated CP Plus playback session: {exc}",
+                detail=f"Could not start the annotated NVR playback session: {exc}",
             ) from exc
 
         session_id = str(info.get("session_id") or "").strip()
@@ -584,7 +595,7 @@ async def start_playback(
             )
 
         return {
-            "message": "Annotated CP Plus playback session started",
+            "message": "Annotated NVR playback session started",
             "data": _response_payload(
                 request=request,
                 annotated=True,
@@ -609,6 +620,7 @@ async def start_playback(
             start_time,
             end_time,
             stream_name,
+            rtsp_source,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -625,18 +637,18 @@ async def start_playback(
             tail = log_path.read_text()[-800:]
         except Exception:
             pass
-        logger.error("CP Plus ffmpeg exited early for %s. Log tail:\n%s", stream_name, tail)
+        logger.error("NVR ffmpeg exited early for %s. Log tail:\n%s", stream_name, tail)
         raise HTTPException(
             status_code=500,
             detail=(
-                "ffmpeg failed to start CP Plus playback. "
-                "Check NVR_IP, camera/channel ID, timestamps, and CP Plus playback permissions. "
+                "ffmpeg failed to start NVR playback. "
+                "Check cameras.nvr_id, cameras.nvr_channel, nvrs.playback_rtsp_template, timestamps, and NVR playback permissions. "
                 f"Log: {tail or '(no log)'}"
             ),
         )
 
     return {
-        "message": "CP Plus playback stream started",
+        "message": "NVR playback stream started",
         "data": _response_payload(
             request=request,
             annotated=False,

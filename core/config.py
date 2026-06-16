@@ -78,53 +78,33 @@ class Settings(BaseSettings):
     MEDIAMTX_CONFIG_PATH: str = "/root/mediamtx.yml"
     MEDIAMTX_PUBLIC_IP: str = "164.52.214.233"
     MEDIAMTX_SOURCE_ON_DEMAND: bool = True
-    MEDIAMTX_FORCE_ON_DEMAND_WITH_DIRECT_RESTREAM: bool = True
     MEDIAMTX_CAMERA_RTSP_TRANSPORT: str = "tcp"
-    MEDIAMTX_WRITE_QUEUE_SIZE: int = 2048
+    MEDIAMTX_WRITE_QUEUE_SIZE: int = 256
     # Optional: let FastAPI start MediaMTX if port 8554 is not already open.
     MEDIAMTX_AUTOSTART: bool = True
     MEDIAMTX_BIN: str = "./mediamtx"
     MEDIAMTX_START_WAIT_SECONDS: float = 8.0
 
-    # Optional H265/H264 clean restream stage.
-    # direct mode: DB camera RTSP -> FFmpeg -> MediaMTX ai/cam<ID>.
-    # mediamtx mode: MediaMTX live/cam<ID> -> FFmpeg -> MediaMTX ai/cam<ID>.
+    # Optional NVDEC/H265 restream stage:
+    # DB camera -> MediaMTX live/cam<ID> -> FFmpeg NVDEC restream -> MediaMTX ai/cam<ID>
     # Pipeline can then read ai/cam<ID>, which is lower-res clean H264.
     NVDEC_RESTREAM_ENABLED: bool = False
-    # direct = FFmpeg reads the DB camera RTSP URL directly and publishes ai/cam<ID>.
-    # mediamtx = old behaviour: FFmpeg reads rtsp://127.0.0.1:8554/live/cam<ID>.
-    NVDEC_RESTREAM_INPUT_MODE: str = "direct"
-    NVDEC_RESTREAM_INPUT_CODEC: str = "auto"  # auto, hevc/h265, h264/avc
-    NVDEC_RESTREAM_DECODER: str = "software"  # software, auto, hevc_cuvid, h264_cuvid
-    NVDEC_RESTREAM_ENCODER: str = "libx264"   # libx264, h264_nvenc, auto
+    NVDEC_RESTREAM_INPUT_CODEC: str = "hevc"  # hevc or h264
+    NVDEC_RESTREAM_DECODER: str = "auto"      # auto, hevc_cuvid, h264_cuvid
+    NVDEC_RESTREAM_ENCODER: str = "libx264"   # libx264 or h264_nvenc if available
     NVDEC_RESTREAM_WIDTH: int = 852
     NVDEC_RESTREAM_HEIGHT: int = 480
-    NVDEC_RESTREAM_FPS: int = 10
-    NVDEC_RESTREAM_BITRATE: str = "1400k"
-    NVDEC_RESTREAM_BUFSIZE: str = "2800k"
-    NVDEC_RESTREAM_GOP: int = 10
+    NVDEC_RESTREAM_FPS: int = 20
+    NVDEC_RESTREAM_BITRATE: str = "1200k"
+    NVDEC_RESTREAM_BUFSIZE: str = "2400k"
+    NVDEC_RESTREAM_GOP: int = 20
     NVDEC_RESTREAM_PRESET: str = "ultrafast"
-    NVDEC_RESTREAM_USE_GPU_SCALE: bool = False
-    NVDEC_RESTREAM_RTSP_TRANSPORT: str = "tcp"
-    NVDEC_RESTREAM_THREAD_QUEUE_SIZE: int = 512
-    NVDEC_RESTREAM_REORDER_QUEUE_SIZE: int = 2048
-    NVDEC_RESTREAM_MAX_DELAY: str = "5000000"
-    NVDEC_RESTREAM_RTBUF_SIZE: str = "64M"
-    NVDEC_RESTREAM_ANALYZEDURATION: str = "20000000"
-    NVDEC_RESTREAM_PROBESIZE: str = "20000000"
-    NVDEC_RESTREAM_OUTPUT_PKT_SIZE: int = 1200
-    NVDEC_RESTREAM_LOGLEVEL: str = "warning"
+    NVDEC_RESTREAM_USE_GPU_SCALE: bool = True
     NVDEC_RESTREAM_LOG_DIR: str = "logs/nvdec_restream"
     NVDEC_RESTREAM_INPUT_PREFIX: str = "live/cam"
     NVDEC_RESTREAM_OUTPUT_PREFIX: str = "ai/cam"
-    NVDEC_RESTREAM_WARMUP_SECONDS: float = 8.0
+    NVDEC_RESTREAM_WARMUP_SECONDS: float = 5.0
     NVDEC_RESTREAM_RESTART_SECONDS: float = 2.0
-    NVDEC_RESTREAM_RESTART_MAX_SECONDS: float = 30.0
-    NVDEC_RESTREAM_STABLE_SECONDS: float = 20.0
-    NVDEC_RESTREAM_START_STAGGER_SECONDS: float = 0.5
-    NVDEC_RESTREAM_AUTO_FALLBACK_LIBX264: bool = True
-    NVDEC_RESTREAM_EXTRA_INPUT_FLAGS: str = ""
-    NVDEC_RESTREAM_EXTRA_OUTPUT_FLAGS: str = ""
     NVDEC_RESTREAM_MAX_CAMERAS: int = 0
     NVDEC_RESTREAM_CAMERA_IDS: str = ""
 
@@ -144,13 +124,12 @@ class Settings(BaseSettings):
     TRACKING_WEBRTC_HEIGHT: int = 480
     TRACKING_WEBRTC_CODEC: str = "auto"
     TRACKING_WEBRTC_BITRATE: str = "1800k"
-    TRACKING_WEBRTC_BUFSIZE: str = "3600k"
+    TRACKING_WEBRTC_BUFSIZE: str = "360k"
     TRACKING_WEBRTC_X264_PRESET: str = "ultrafast"
     TRACKING_WEBRTC_MODE: str = "hybrid"
     TRACKING_WEBRTC_OVERLAY_MAX_AGE_MS: int = 1500
     TRACKING_WEBRTC_DRAW_STATS: bool = True
     TRACKING_WEBRTC_LOG_DIR: str = "logs/ffmpeg_webrtc"
-    TRACKING_WEBRTC_OUTPUT_PKT_SIZE: int = 1200
     TRACKING_WEBRTC_BOOTSTRAP_PLACEHOLDER: bool = True
 
     # Live unknown-box visibility.  Defaults keep live monitoring behavior unchanged:
@@ -186,8 +165,8 @@ class Settings(BaseSettings):
 
     # Do not start one FFmpeg encoder per camera at backend startup.  Publishers
     # are started on demand when /v1/tracking/webrtc/{camera_id} is requested.
-    # This is important for many cameras on cloud nodes because each publisher
-    # is an additional encoder even when AI inference is already running.
+    # This is important for 12+ cameras on A100 because A100 has no NVENC;
+    # libx264 encoding is CPU-bound.
     TRACKING_WEBRTC_AUTOSTART: bool = False
     TRACKING_WEBRTC_MAX_ACTIVE_PUBLISHERS: int = 0  # 0 = unlimited; set 4/6 if CPU is tight
 
@@ -260,7 +239,6 @@ class Settings(BaseSettings):
     PLAYBACK_WEBRTC_BITRATE: str = "6000k"
     PLAYBACK_WEBRTC_BUFSIZE: str = "12000k"
     PLAYBACK_WEBRTC_PRESET: str = "ultrafast"
-    PLAYBACK_WEBRTC_OUTPUT_PKT_SIZE: int = 1200
     PLAYBACK_WEBRTC_OVERLAY_MAX_AGE_MS: int = 800
 
     # CP Plus playback clean restream stage. This is intentionally separate from

@@ -156,16 +156,6 @@ def build_mediamtx_config(cameras: List[Dict[str, Any]]) -> str:
     public_ip = _env("MEDIAMTX_PUBLIC_IP", "").strip() or _env("PUBLIC_IP", "").strip() or "164.52.214.233"
     write_queue = _env("MEDIAMTX_WRITE_QUEUE_SIZE", "256")
     source_on_demand = _bool_env("MEDIAMTX_SOURCE_ON_DEMAND", False)
-    # In direct restream mode, FFmpeg already pulls the camera/NVR directly and
-    # publishes ai/cam<ID>. Keeping live/cam<ID> always-on doubles the inbound
-    # H265 traffic and makes cloud RTP packet loss much worse. Keep live paths
-    # available, but start them only when someone explicitly reads live/cam<ID>.
-    if (
-        _bool_env("NVDEC_RESTREAM_ENABLED", False)
-        and _env("NVDEC_RESTREAM_INPUT_MODE", "direct").strip().lower() == "direct"
-        and _bool_env("MEDIAMTX_FORCE_ON_DEMAND_WITH_DIRECT_RESTREAM", True)
-    ):
-        source_on_demand = True
     on_demand_str = "yes" if source_on_demand else "no"
     rtsp_transport = _env("MEDIAMTX_CAMERA_RTSP_TRANSPORT", "tcp") or "tcp"
 

@@ -590,7 +590,7 @@ class EmbeddingDBUpdater:
             __tablename__ = "member_embeddings"
             id = Column(BigInteger, primary_key=True)
             member_id = Column(Integer, nullable=False)
-            camera_id = Column(Integer, nullable=False)
+            camera_id = Column(Integer, nullable=True)
             if Vector is not None:
                 body_embedding = Column(Vector(EXPECTED_DIM), nullable=True)
                 face_embedding = Column(Vector(EXPECTED_DIM), nullable=True)
@@ -1091,7 +1091,7 @@ def build_galleries_from_db(
         __tablename__ = "member_embeddings"
         id = Column(BigInteger, primary_key=True)
         member_id = Column(Integer, nullable=False)
-        camera_id = Column(Integer, nullable=False)
+        camera_id = Column(Integer, nullable=True)
         if Vector is not None:
             body_embedding = Column(Vector(EXPECTED_DIM), nullable=True)
             face_embedding = Column(Vector(EXPECTED_DIM), nullable=True)
@@ -1132,9 +1132,24 @@ def build_galleries_from_db(
                 .join(MemberRow, MemberRow.id == MemberEmbeddingRow.member_id)
             )
             rows = session.execute(stmt).all()
+            skipped_bad_member_id = 0
+            skipped_bad_camera_id = 0
             for r in rows:
-                mid = int(r.member_id)
-                cam_id = int(r.camera_id)
+                try:
+                    mid = int(r.member_id)
+                except Exception:
+                    skipped_bad_member_id += 1
+                    continue
+
+                raw_cam_id = getattr(r, "camera_id", None)
+                cam_id: Optional[int] = None
+                if raw_cam_id is not None:
+                    try:
+                        cam_id = int(raw_cam_id)
+                    except Exception:
+                        skipped_bad_camera_id += 1
+                        cam_id = None
+
                 member_number = str(r.member_number or "").strip()
                 first = str(r.first_name or "").strip()
                 last = str(r.last_name or "").strip()
@@ -1186,7 +1201,16 @@ def build_galleries_from_db(
                     body_bank = body_cent.reshape(1, -1).astype(np.float32)
                 if body_bank is not None and body_bank.ndim == 2 and body_bank.shape[1] == EXPECTED_DIM:
                     body_bank = l2_normalize_rows(body_bank.astype(np.float32))
-                people_by_cam[cam_id].append(PersonEntry(mid, name, cam_id, body_bank, body_cent))
+
+                # Body ReID gallery is camera-specific.  A NULL camera_id can happen
+                # after a camera row is deleted (model uses ondelete=SET NULL), so do
+                # not crash playback.  Skip only the camera-scoped body entry, but
+                # still keep the face embedding below because face IDs are global.
+                if cam_id is not None and cam_id > 0:
+                    people_by_cam[int(cam_id)].append(PersonEntry(mid, name, int(cam_id), body_bank, body_cent))
+                elif body_bank is not None or body_cent is not None:
+                    skipped_bad_camera_id += 1
+
                 if face_cent is not None:
                     face_vecs_by_member[mid].append(face_cent.astype(np.float32))
     finally:
@@ -1218,6 +1242,13 @@ def build_galleries_from_db(
         filter_desc = ", ".join(filter_desc_parts) if filter_desc_parts else "none"
     else:
         filter_desc = "all"
+    try:
+        if 'skipped_bad_member_id' in locals() and skipped_bad_member_id:
+            print(f"[DB][WARN] skipped member_embeddings rows with invalid member_id: {skipped_bad_member_id}")
+        if 'skipped_bad_camera_id' in locals() and skipped_bad_camera_id:
+            print(f"[DB][WARN] skipped body gallery rows with missing/invalid camera_id: {skipped_bad_camera_id}")
+    except Exception:
+        pass
     print(
         f"[DB] Loaded member_embeddings: body_entries={total_body_entries} | "
         f"face_identities={len(fg_names)} | mode={mode} | filter={filter_desc}"
